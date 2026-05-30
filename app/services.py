@@ -6,9 +6,11 @@ from django.conf import settings
 from django.db import transaction
 
 from .agents.marmitaria_agent import responder_com_agente
+from .agents.orchestrator_agent import OrchestratorAgent
 from .models import Cliente, ConfiguracaoMarmitaria, Conversa, Mensagem
 
 logger = logging.getLogger(__name__)
+orchestrator_agent = OrchestratorAgent()
 
 
 def obter_configuracao_ativa():
@@ -75,6 +77,17 @@ def obter_historico(conversa: Conversa, limite: int = 20):
     return list(conversa.mensagens.order_by('-criado_em')[:limite][::-1])
 
 
+def gerar_resposta_atendimento(texto: str) -> str:
+    try:
+        result = orchestrator_agent.handle_message(texto)
+        resposta = (result.get('final_response') or '').strip()
+        if resposta:
+            return resposta
+    except Exception as exc:
+        logger.exception('Falha ao gerar resposta com OrchestratorAgent: %s', exc)
+    return ''
+
+
 def processar_mensagem_whatsapp(payload: dict) -> None:
     """
     Em producao, mover este processamento para Celery + Redis para evitar bloquear o webhook.
@@ -114,7 +127,9 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
                 logger.info('Conversa %s em modo humano, sem resposta automatica.', conversa.id)
                 return
 
-            resposta = responder_com_agente(cliente=cliente, conversa=conversa, texto=texto)
+            resposta = gerar_resposta_atendimento(texto=texto)
+            if not resposta:
+                resposta = responder_com_agente(cliente=cliente, conversa=conversa, texto=texto)
             if not resposta:
                 return
 

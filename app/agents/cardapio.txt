@@ -1,0 +1,49 @@
+# Cardápio Semanal para Testes do Agente de Instruções
+
+Use este arquivo como base de teste para o agente que lê instruções em arquivo de texto.
+O agente deve conseguir responder perguntas sobre o cardápio de segunda-feira a sábado.
+
+## Segunda-feira
+Prato principal: Arroz, feijão, bife acebolado e salada de alface com tomate.
+Acompanhamento: Farofa simples.
+Bebida sugerida: Suco natural de laranja.
+Sobremesa: Gelatina.
+
+## Terça-feira
+Prato principal: Arroz, feijão, frango grelhado e purê de batata.
+Acompanhamento: Legumes cozidos.
+Bebida sugerida: Suco de maracujá.
+Sobremesa: Banana.
+
+## Quarta-feira
+Prato principal: Macarrão ao molho bolonhesa com queijo ralado.
+Acompanhamento: Salada de repolho com cenoura.
+Bebida sugerida: Suco de uva.
+Sobremesa: Pudim.
+
+## Quinta-feira
+Prato principal: Arroz, feijão, carne de panela e mandioca cozida.
+Acompanhamento: Vinagrete.
+Bebida sugerida: Suco de limão.
+Sobremesa: Maçã.
+
+## Sexta-feira
+Prato principal: Arroz, feijão, filé de peixe grelhado e batata sauté.
+Acompanhamento: Salada verde.
+Bebida sugerida: Suco de abacaxi.
+Sobremesa: Doce de leite.
+
+## Sábado
+Prato principal: Feijoada completa com arroz, couve e farofa.
+Acompanhamento: Laranja fatiada.
+Bebida sugerida: Suco de acerola.
+Sobremesa: Mousse de maracujá.
+
+## Regras de Resposta para Teste
+
+1. Quando o usuário perguntar o cardápio de um dia específico, responda apenas o cardápio daquele dia.
+2. Quando o usuário perguntar o cardápio da semana, liste de segunda-feira a sábado.
+3. Quando o usuário perguntar por sobremesa, informe somente a sobremesa do dia solicitado.
+4. Quando o usuário perguntar por bebida, informe somente a bebida sugerida do dia solicitado.
+5. Se o usuário perguntar sobre domingo, informe que não há cardápio cadastrado para domingo.
+6. Responda sempre em português do Brasil, de forma objetiva e educada.
