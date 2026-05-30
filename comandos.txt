@@ -1,0 +1,4 @@
+para o celery:
+celery -A marmitaria_ia worker -l info -P solo
+para n ngrok:
+ngrok http 8000

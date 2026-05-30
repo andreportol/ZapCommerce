@@ -1,3 +1,7 @@
+import re
+import unicodedata
+from datetime import datetime
+
 from .base_agent import AgentExecutionError, create_base_agent, run_text
 from .cardapio_agent import CardapioAgent
 from .database_agent import DatabaseAgent
@@ -5,6 +9,9 @@ from .file_agent import FileAgent
 from .instructions_agent import InstructionsAgent
 from .llm_config import LLMConfigError
 from .message_agent import MessageAgent
+from .order_agent import OrderAgent
+from .rag import RagAgent
+from .conversation_state import AtendimentoStatus, get_or_create_state, update_state
 
 
 class OrchestratorAgent:
@@ -14,6 +21,8 @@ class OrchestratorAgent:
         self.message_agent = MessageAgent()
         self.instructions_agent = InstructionsAgent()
         self.cardapio_agent = CardapioAgent()
+        self.rag_agent = RagAgent()
+        self.order_agent = OrderAgent()
         self.database_agent = DatabaseAgent()
         self.file_agent = FileAgent()
         self._llm_agent = None
@@ -36,11 +45,97 @@ class OrchestratorAgent:
         except LLMConfigError:
             self._llm_agent = None
 
-    def handle_message(self, message: str, file_name: str = "", file_mimetype: str = "") -> dict:
+    def handle_message(
+        self,
+        message: str,
+        file_name: str = "",
+        file_mimetype: str = "",
+        telefone: str = "",
+    ) -> dict:
+        phone_key = (telefone or "sessao_padrao").strip()
+        conversation_state = get_or_create_state(phone_key)
+        if (
+            conversation_state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO
+            and self._is_order_confirmation_from_offer(message)
+        ):
+            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            response = self._start_order_prompt()
+            return {
+                "intent": "fazer_pedido",
+                "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
+                "instructions": self.instructions_agent.get_instructions(),
+                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+                "rag_results": self.rag_agent.search(message, top_k=2).get("results", []),
+                "file_info": None,
+                "order_state": order_data.get("state"),
+                "final_response": response,
+            }
+
         analysis = self.message_agent.analyze(message)
         instructions = self.instructions_agent.get_instructions()
         cardapio = self.cardapio_agent.get_cardapio()
+        rag_result = self.rag_agent.search(message, top_k=4)
+        rag_snippets = rag_result.get("results", [])
         file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if file_name else None
+
+        if analysis.menu_option == "1":
+            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            return {
+                "intent": "fazer_pedido",
+                "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": order_data.get("state"),
+                "final_response": self._start_order_prompt(),
+            }
+
+        if self._is_order_flow_message(message, conversation_state):
+            if self._is_menu_request_during_order(message):
+                cardapio_response = self._build_cardapio_response_for_order(message, cardapio)
+                if conversation_state.status_atendimento in {
+                    AtendimentoStatus.AGUARDANDO_PRODUTO,
+                    AtendimentoStatus.FAZENDO_PEDIDO,
+                    AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO,
+                }:
+                    update_state(phone_key, status_atendimento=AtendimentoStatus.AGUARDANDO_PRODUTO)
+                return {
+                    "intent": "consultando_cardapio",
+                    "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
+                    "instructions": instructions,
+                    "cardapio_loaded": bool(cardapio),
+                    "rag_results": rag_snippets,
+                    "file_info": file_info.__dict__ if file_info else None,
+                    "order_state": get_or_create_state(phone_key).__dict__,
+                    "final_response": cardapio_response,
+                }
+
+            if self._is_total_price_question(message) and conversation_state.valor_total > 0:
+                total = f"R$ {conversation_state.valor_total:.2f}".replace(".", ",")
+                return {
+                    "intent": "fazer_pedido",
+                    "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
+                    "instructions": instructions,
+                    "cardapio_loaded": bool(cardapio),
+                    "rag_results": rag_snippets,
+                    "file_info": file_info.__dict__ if file_info else None,
+                    "order_state": conversation_state.__dict__,
+                    "final_response": f"O total do seu pedido e {total}.",
+                }
+
+            order_data = self.order_agent.process_message(phone_key, message)
+            return {
+                "intent": "fazer_pedido",
+                "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": order_data.get("state"),
+                "final_response": order_data.get("response", ""),
+            }
+
         menu_response = self._handle_menu_option(analysis.menu_option)
         if menu_response:
             return {
@@ -48,6 +143,7 @@ class OrchestratorAgent:
                 "database": {"implemented": False, "message": "Fluxo de menu local.", "data": None},
                 "instructions": instructions,
                 "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
                 "final_response": menu_response,
             }
@@ -64,18 +160,153 @@ class OrchestratorAgent:
             intent=analysis.intent,
             instructions=instructions,
             cardapio=cardapio,
+            rag_snippets=rag_snippets,
             db_result=db_result,
             file_info=file_info,
         )
-        final_response = self._generate_final_response(context, analysis.intent, file_info is not None)
+        rule_response = self._response_from_rag_rules(message=message, cardapio=cardapio, rag_snippets=rag_snippets)
+        if rule_response:
+            final_response = rule_response
+        else:
+            final_response = self._generate_final_response(
+                context=context,
+                intent=analysis.intent,
+                has_file=file_info is not None,
+                rag_snippets=rag_snippets,
+            )
+        self._maybe_mark_awaiting_order_confirmation(phone_key, final_response)
         return {
             "intent": analysis.intent,
             "database": db_result,
             "instructions": instructions,
             "cardapio_loaded": bool(cardapio),
+            "rag_results": rag_snippets,
             "file_info": file_info.__dict__ if file_info else None,
             "final_response": final_response,
         }
+
+    def _is_order_confirmation_from_offer(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        confirmations = {
+            "sim",
+            "quero",
+            "eu quero",
+            "gostaria",
+            "quero sim",
+            "pode ser",
+            "beleza",
+            "ok",
+            "isso",
+            "bora",
+            "vamos",
+            "pode fazer",
+            "quero fazer pedido",
+        }
+        return text in confirmations
+
+    def _normalize_short_text(self, text: str) -> str:
+        raw = (text or "").strip().lower()
+        raw = "".join(ch for ch in unicodedata.normalize("NFD", raw) if unicodedata.category(ch) != "Mn")
+        raw = re.sub(r"[^a-z0-9\s]", " ", raw)
+        return re.sub(r"\s+", " ", raw).strip()
+
+    def _start_order_prompt(self) -> str:
+        return (
+            "Perfeito 😊 Vamos fazer seu pedido.\n\n"
+            "Voce deseja:\n"
+            "1 - Marmitex individual\n"
+            "2 - Marmita para 2 pessoas\n"
+            "3 - Marmita para 3 pessoas\n"
+            "4 - Marmita para 4 pessoas\n"
+            "5 - Marmita para 5 pessoas\n\n"
+            'Ou, se preferir, me diga direto a quantidade. Exemplo: "quero 3 marmitex".'
+        )
+
+    def _maybe_mark_awaiting_order_confirmation(self, telefone: str, response: str) -> None:
+        text = (response or "").lower()
+        offer_patterns = [
+            "se quiser fazer um pedido",
+            "se quiser fazer pedido",
+            "quiser fazer um pedido",
+            "quiser fazer pedido",
+            "e so me avisar",
+            "é só me avisar",
+        ]
+        if any(p in text for p in offer_patterns):
+            state = get_or_create_state(telefone)
+            if state.status_atendimento == AtendimentoStatus.INICIO:
+                from .conversation_state import update_state
+
+                update_state(
+                    telefone,
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO,
+                    aguardando_resposta="confirmacao_fazer_pedido",
+                )
+
+    def _is_order_flow_message(self, message: str, state) -> bool:
+        text = (message or "").strip().lower()
+        wants_order = any(
+            k in text
+            for k in [
+                "fazer pedido",
+                "quero fazer pedido",
+                "quero pedir",
+                "gostaria de pedir",
+                "quero marmita",
+                "quero marmitex",
+                "marmita",
+                "marmitex",
+                "pedido",
+                "pedir",
+            ]
+        )
+        affirmative = text in {"sim", "quero", "gostaria"}
+        order_statuses = {
+            AtendimentoStatus.FAZENDO_PEDIDO,
+            AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM,
+            AtendimentoStatus.AGUARDANDO_PRODUTO,
+            AtendimentoStatus.AGUARDANDO_QUANTIDADE,
+            AtendimentoStatus.AGUARDANDO_ENDERECO,
+            AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+            AtendimentoStatus.AGUARDANDO_CONFIRMACAO,
+        }
+        in_order = state.status_atendimento in order_statuses or state.ultima_intencao == "fazer_pedido"
+        return wants_order or (affirmative and in_order) or in_order
+
+    def _is_total_price_question(self, message: str) -> bool:
+        text = (message or "").strip().lower()
+        return "valor total" in text or ("total" in text and "pedido" in text)
+
+    def _is_menu_request_during_order(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        triggers = [
+            "cardapio",
+            "menu de hoje",
+            "comida de hoje",
+            "o que tem hoje",
+            "primeiro preciso saber o cardapio",
+            "me informe o cardapio",
+            "qual o prato de hoje",
+        ]
+        return any(t in text for t in triggers)
+
+    def _build_cardapio_response_for_order(self, message: str, cardapio: str) -> str:
+        day = self._extract_weekday((message or "").lower())
+        if not day:
+            day = self._current_weekday_ptbr()
+        day_menu = self._extract_day_menu(cardapio, day)
+        if day_menu:
+            return (
+                f"Claro 😊 O cardapio de {day} e:\n\n"
+                f"{day_menu}\n\n"
+                "Agora, para continuar seu pedido, voce deseja marmitex individual "
+                "ou marmita para quantas pessoas?"
+            )
+        return (
+            "Posso te informar o cardapio, mas preciso confirmar o dia da semana primeiro.\n\n"
+            "Agora, para continuar seu pedido, voce deseja marmitex individual "
+            "ou marmita para quantas pessoas?"
+        )
 
     def _handle_menu_option(self, menu_option: str) -> str:
         if menu_option == "1":
@@ -105,6 +336,7 @@ class OrchestratorAgent:
         intent: str,
         instructions: str,
         cardapio: str,
+        rag_snippets: list[dict],
         db_result: dict,
         file_info,
     ) -> str:
@@ -116,6 +348,10 @@ class OrchestratorAgent:
                 f"mimetype={file_info.mimetype or 'nao informado'}"
             )
 
+        rag_section = "\n".join(
+            f"- {item.get('text', '')}" for item in rag_snippets if item.get("text")
+        ) or "Nenhum trecho relevante encontrado."
+
         return (
             f"Mensagem do usuario: {message}\n"
             f"Intencao detectada: {intent}\n"
@@ -123,11 +359,17 @@ class OrchestratorAgent:
             f"Dados retornados do banco: {db_result.get('data')}\n"
             f"Arquivo recebido: {file_section}\n"
             f"Instrucoes de atendimento: {instructions}\n"
+            f"Trechos recuperados pelo RAG:\n{rag_section}\n"
             f"Cardapio em arquivo texto:\n{cardapio or 'Nao ha cardapio carregado.'}\n"
             "Gere apenas a resposta final para o usuario em 1 a 4 frases curtas."
         )
 
-    def _generate_final_response(self, context: str, intent: str, has_file: bool) -> str:
+    def _generate_final_response(self, context: str, intent: str, has_file: bool, rag_snippets: list[dict]) -> str:
+        if not rag_snippets:
+            return (
+                "Nao encontrei dados suficientes nas instrucoes para responder com seguranca. "
+                "Pode me dar mais detalhes, por favor?"
+            )
         if self._llm_agent is not None:
             try:
                 response = run_text(self._llm_agent, context)
@@ -156,6 +398,93 @@ class OrchestratorAgent:
         if intent == "atendimento humano":
             return "Entendi. Vou encaminhar seu atendimento para uma pessoa da equipe."
         return "Posso te ajudar melhor se voce me contar mais detalhes do que precisa."
+
+    def _response_from_rag_rules(self, message: str, cardapio: str, rag_snippets: list[dict]) -> str:
+        msg = message.lower()
+        rag_text = " ".join(item.get("text", "") for item in rag_snippets).lower()
+
+        if "marmitex" in msg and ("custa" in msg or "valor" in msg or "preco" in msg or "preço" in msg):
+            if "r$ 21,00" in rag_text or "r$ 21,00" in cardapio.lower() or "r$ 21,00" in rag_text.replace(" ", ""):
+                return "A marmitex individual custa R$ 21,00."
+
+        people_count = self._extract_people_count(msg)
+        if people_count is not None:
+            if people_count > 5:
+                if "acima de 5 pessoas" in rag_text or "mais de 5 pessoas" in rag_text:
+                    return (
+                        "Para pedidos acima de 5 pessoas, preciso consultar a proprietaria "
+                        "do estabelecimento para confirmar o valor certinho."
+                    )
+            if 2 <= people_count <= 5:
+                value = self._extract_price_for_people(rag_text, people_count)
+                if value:
+                    return f"A marmita para {people_count} pessoas custa {value}."
+
+        if "cardapio" in msg or "cardápio" in msg:
+            day = self._extract_weekday(msg)
+            if not day:
+                day = self._current_weekday_ptbr()
+            day_menu = self._extract_day_menu(cardapio, day)
+            if day_menu:
+                return f"Considerando {day}, o cardapio e:\n{day_menu}"
+            return "Para eu te informar certinho, pode confirmar qual dia da semana voce quer consultar?"
+
+        return ""
+
+    def _extract_people_count(self, text: str) -> int | None:
+        m = re.search(r"\b(\d{1,2})\s*pessoas?\b", text)
+        if not m:
+            return None
+        return int(m.group(1))
+
+    def _extract_price_for_people(self, rag_text: str, people_count: int) -> str:
+        pattern = rf"marmita para {people_count} pessoas?:\s*(r\$\s*\d+,\d{{2}})"
+        m = re.search(pattern, rag_text, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        return m.group(1).upper().replace("  ", " ")
+
+    def _extract_weekday(self, text: str) -> str:
+        weekdays = ["segunda-feira", "terca-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sabado", "sábado", "domingo"]
+        for day in weekdays:
+            if day in text:
+                return day
+        return ""
+
+    def _current_weekday_ptbr(self) -> str:
+        mapping = {
+            0: "segunda-feira",
+            1: "terca-feira",
+            2: "quarta-feira",
+            3: "quinta-feira",
+            4: "sexta-feira",
+            5: "sabado",
+            6: "domingo",
+        }
+        return mapping.get(datetime.now().weekday(), "")
+
+    def _extract_day_menu(self, cardapio: str, day: str) -> str:
+        if not cardapio or not day:
+            return ""
+        aliases = {
+            "segunda-feira": ["segunda-feira"],
+            "terca-feira": ["terca-feira", "terça-feira"],
+            "quarta-feira": ["quarta-feira"],
+            "quinta-feira": ["quinta-feira"],
+            "sexta-feira": ["sexta-feira"],
+            "sabado": ["sabado", "sábado", "sabado-feira", "sábado-feira"],
+            "domingo": ["domingo"],
+        }
+        candidates = aliases.get(day, [day])
+        for candidate in candidates:
+            escaped_day = re.escape(candidate).replace(r"\ ", r"\s+")
+            pattern = rf"##\s*{escaped_day}\s*(.*?)(?=\n##\s|\Z)"
+            m = re.search(pattern, cardapio, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
+            return "\n".join(lines[:4]).strip()
+        return ""
 
 
 def run_orchestrator_test_cases() -> dict:
