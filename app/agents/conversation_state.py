@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -6,6 +6,8 @@ class ConversationState:
     telefone: str
     status_atendimento: str = "inicio"
     ultima_intencao: str = ""
+    itens_pedido: list[dict] = field(default_factory=list)
+    tipo_entrega: str = ""
     produto: str = ""
     quantidade: int = 0
     valor_unitario: float = 0.0
@@ -20,6 +22,7 @@ class AtendimentoStatus:
     CONSULTANDO_CARDAPIO = "consultando_cardapio"
     AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO = "aguardando_confirmacao_fazer_pedido"
     FAZENDO_PEDIDO = "fazendo_pedido"
+    AGUARDANDO_TIPO_ENTREGA = "aguardando_tipo_entrega"
     AGUARDANDO_CONFIRMACAO_ITEM = "aguardando_confirmacao_item"
     AGUARDANDO_PRODUTO = "aguardando_produto"
     AGUARDANDO_QUANTIDADE = "aguardando_quantidade"

@@ -1,6 +1,7 @@
 import re
 import unicodedata
-from datetime import datetime
+
+from django.utils import timezone
 
 from .base_agent import AgentExecutionError, create_base_agent, run_text
 from .cardapio_agent import CardapioAgent
@@ -78,7 +79,22 @@ class OrchestratorAgent:
         rag_snippets = rag_result.get("results", [])
         file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if file_name else None
 
-        if analysis.menu_option == "1":
+        if (
+            conversation_state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO
+            and self._is_cardapio_followup(message)
+        ):
+            cardapio_response = self._build_cardapio_response(message, cardapio)
+            return {
+                "intent": "consultando_cardapio",
+                "database": {"implemented": False, "message": "Consulta local de cardapio.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": cardapio_response,
+            }
+
+        if analysis.menu_option == "1" and conversation_state.status_atendimento == AtendimentoStatus.INICIO:
             order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
             return {
                 "intent": "fazer_pedido",
@@ -91,9 +107,25 @@ class OrchestratorAgent:
                 "final_response": self._start_order_prompt(),
             }
 
+        if analysis.menu_option == "2" and conversation_state.status_atendimento == AtendimentoStatus.INICIO:
+            update_state(
+                phone_key,
+                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+                aguardando_resposta="cardapio",
+            )
+            return {
+                "intent": "consultando_cardapio",
+                "database": {"implemented": False, "message": "Consulta local de cardapio.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": self._build_cardapio_response("hoje", cardapio),
+            }
+
         if self._is_order_flow_message(message, conversation_state):
-            if self._is_menu_request_during_order(message):
-                cardapio_response = self._build_cardapio_response_for_order(message, cardapio)
+            if self._is_menu_request_during_order(message, conversation_state):
+                cardapio_response = self._build_cardapio_response_for_order(message, cardapio, conversation_state)
                 if conversation_state.status_atendimento in {
                     AtendimentoStatus.AGUARDANDO_PRODUTO,
                     AtendimentoStatus.FAZENDO_PEDIDO,
@@ -263,11 +295,13 @@ class OrchestratorAgent:
         affirmative = text in {"sim", "quero", "gostaria"}
         order_statuses = {
             AtendimentoStatus.FAZENDO_PEDIDO,
+            AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA,
             AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM,
             AtendimentoStatus.AGUARDANDO_PRODUTO,
             AtendimentoStatus.AGUARDANDO_QUANTIDADE,
             AtendimentoStatus.AGUARDANDO_ENDERECO,
             AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+            AtendimentoStatus.AGUARDANDO_COMPROVANTE,
             AtendimentoStatus.AGUARDANDO_CONFIRMACAO,
         }
         in_order = state.status_atendimento in order_statuses or state.ultima_intencao == "fazer_pedido"
@@ -277,7 +311,7 @@ class OrchestratorAgent:
         text = (message or "").strip().lower()
         return "valor total" in text or ("total" in text and "pedido" in text)
 
-    def _is_menu_request_during_order(self, message: str) -> bool:
+    def _is_menu_request_during_order(self, message: str, state) -> bool:
         text = self._normalize_short_text(message)
         triggers = [
             "cardapio",
@@ -288,25 +322,80 @@ class OrchestratorAgent:
             "me informe o cardapio",
             "qual o prato de hoje",
         ]
-        return any(t in text for t in triggers)
+        if any(t in text for t in triggers):
+            return True
+        if state.status_atendimento == AtendimentoStatus.INICIO and state.ultima_intencao != "fazer_pedido":
+            return False
+        return bool(self._extract_weekday(text))
 
-    def _build_cardapio_response_for_order(self, message: str, cardapio: str) -> str:
-        day = self._extract_weekday((message or "").lower())
+    def _is_cardapio_followup(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return (
+            self._is_today_request(text)
+            or bool(self._extract_weekday(text))
+            or "cardapio" in text
+            or "menu" in text
+            or "prato" in text
+        )
+
+    def _is_today_request(self, normalized_text: str) -> bool:
+        return normalized_text in {"hoje", "o de hoje", "de hoje", "cardapio de hoje", "menu de hoje"} or "hoje" in normalized_text
+
+    def _build_cardapio_response(self, message: str, cardapio: str) -> str:
+        normalized = self._normalize_short_text(message)
+        day = self._extract_weekday(message or "")
+        if not day or self._is_today_request(normalized):
+            day = self._current_weekday_ptbr()
+            prefix = f"Claro 😊 Hoje é {self._display_weekday(day)}. O cardápio de hoje é:"
+        else:
+            prefix = f"Claro 😊 O cardápio de {self._display_weekday(day)} é:"
+
+        day_menu = self._extract_day_menu(cardapio, day)
+        if not day_menu:
+            return "Nao encontrei cardápio cadastrado para esse dia. Pode me dizer outro dia da semana?"
+        return f"{prefix}\n\n{day_menu}"
+
+    def _display_weekday(self, day: str) -> str:
+        labels = {
+            "segunda-feira": "segunda-feira",
+            "terca-feira": "terça-feira",
+            "quarta-feira": "quarta-feira",
+            "quinta-feira": "quinta-feira",
+            "sexta-feira": "sexta-feira",
+            "sabado": "sábado",
+            "domingo": "domingo",
+        }
+        return labels.get(day, day)
+
+    def _build_cardapio_response_for_order(self, message: str, cardapio: str, state) -> str:
+        day = self._extract_weekday(message or "")
         if not day:
             day = self._current_weekday_ptbr()
         day_menu = self._extract_day_menu(cardapio, day)
+        continuation = self._order_continuation_prompt(state)
         if day_menu:
             return (
-                f"Claro 😊 O cardapio de {day} e:\n\n"
+                f"Claro 😊 O cardápio de {self._display_weekday(day)} é:\n\n"
                 f"{day_menu}\n\n"
-                "Agora, para continuar seu pedido, voce deseja marmitex individual "
-                "ou marmita para quantas pessoas?"
+                f"{continuation}"
             )
         return (
-            "Posso te informar o cardapio, mas preciso confirmar o dia da semana primeiro.\n\n"
-            "Agora, para continuar seu pedido, voce deseja marmitex individual "
-            "ou marmita para quantas pessoas?"
+            "Posso te informar o cardápio, mas preciso confirmar o dia da semana primeiro.\n\n"
+            f"{continuation}"
         )
+
+    def _order_continuation_prompt(self, state) -> str:
+        if not state.itens_pedido and not state.produto:
+            return "Agora, para continuar seu pedido, voce deseja marmitex individual ou marmita para quantas pessoas?"
+        if not state.tipo_entrega:
+            return "Agora, para continuar seu pedido, voce prefere entrega ou retirada no local?"
+        if state.tipo_entrega == "entrega" and not state.endereco:
+            return "Agora, para continuar seu pedido, me informe o endereco de entrega, por favor."
+        if not state.forma_pagamento:
+            return "Agora, para continuar seu pedido, qual sera a forma de pagamento? Pix, dinheiro ou cartao?"
+        if state.forma_pagamento == "Pix" and state.status_atendimento == AtendimentoStatus.AGUARDANDO_COMPROVANTE:
+            return "Agora, para continuar seu pedido, pode enviar o comprovante por aqui."
+        return "Agora, para continuar seu pedido, confirme se esta tudo certo, por favor."
 
     def _handle_menu_option(self, menu_option: str) -> str:
         if menu_option == "1":
@@ -445,10 +534,19 @@ class OrchestratorAgent:
         return m.group(1).upper().replace("  ", " ")
 
     def _extract_weekday(self, text: str) -> str:
-        weekdays = ["segunda-feira", "terca-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sabado", "sábado", "domingo"]
-        for day in weekdays:
-            if day in text:
-                return day
+        normalized = self._normalize_short_text(text)
+        aliases = {
+            "segunda-feira": ["segunda feira", "segunda-feira", "segunda"],
+            "terca-feira": ["terca feira", "terca-feira", "terca", "terça feira", "terça-feira", "terça"],
+            "quarta-feira": ["quarta feira", "quarta-feira", "quarta"],
+            "quinta-feira": ["quinta feira", "quinta-feira", "quinta"],
+            "sexta-feira": ["sexta feira", "sexta-feira", "sexta"],
+            "sabado": ["sabado", "sabado feira", "sábado", "sábado feira"],
+            "domingo": ["domingo"],
+        }
+        for canonical, values in aliases.items():
+            if any(value in normalized for value in values):
+                return canonical
         return ""
 
     def _current_weekday_ptbr(self) -> str:
@@ -461,14 +559,14 @@ class OrchestratorAgent:
             5: "sabado",
             6: "domingo",
         }
-        return mapping.get(datetime.now().weekday(), "")
+        return mapping.get(timezone.localdate().weekday(), "")
 
     def _extract_day_menu(self, cardapio: str, day: str) -> str:
         if not cardapio or not day:
             return ""
         aliases = {
-            "segunda-feira": ["segunda-feira"],
-            "terca-feira": ["terca-feira", "terça-feira"],
+            "segunda-feira": ["segunda-feira", "segunda feira", "segunda"],
+            "terca-feira": ["terca-feira", "terça-feira", "terca feira", "terça feira", "terca", "terça"],
             "quarta-feira": ["quarta-feira"],
             "quinta-feira": ["quinta-feira"],
             "sexta-feira": ["sexta-feira"],
