@@ -29,6 +29,7 @@ class AtendimentoStatus:
     AGUARDANDO_ENDERECO = "aguardando_endereco"
     AGUARDANDO_PAGAMENTO = "aguardando_pagamento"
     AGUARDANDO_COMPROVANTE = "aguardando_comprovante"
+    AGUARDANDO_CONFERENCIA_PAGAMENTO = "aguardando_conferencia_pagamento"
     AGUARDANDO_CONFIRMACAO = "aguardando_confirmacao"
     ENCAMINHAR_ATENDENTE = "encaminhar_atendente"
 

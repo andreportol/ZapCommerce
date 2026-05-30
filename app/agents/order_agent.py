@@ -3,6 +3,7 @@ import unicodedata
 from dataclasses import asdict
 
 from .conversation_state import AtendimentoStatus, get_or_create_state, reset_state, update_state
+from .payment_proof_agent import PaymentProofAgent
 
 PRICE_TABLE = {
     "marmitex_individual": 21.00,
@@ -31,7 +32,16 @@ NUMBER_WORDS = {
 class OrderAgent:
     """Controla montagem de pedido durante a conversa."""
 
-    def process_message(self, telefone: str, message: str) -> dict:
+    def __init__(self) -> None:
+        self.payment_proof_agent = PaymentProofAgent()
+
+    def process_message(
+        self,
+        telefone: str,
+        message: str,
+        file_name: str = "",
+        file_mimetype: str = "",
+    ) -> dict:
         state = get_or_create_state(telefone)
         text = (message or "").strip().lower()
         normalized = self._normalize(text)
@@ -192,7 +202,10 @@ class OrderAgent:
                 ),
             }
 
-        if self._is_price_consultation(normalized) or self._is_price_followup(normalized, state):
+        explicit_order_request = self._is_explicit_order_request(normalized)
+        if (
+            self._is_price_consultation(normalized) or self._is_price_followup(normalized, state)
+        ) and not explicit_order_request:
             response = self._build_price_consultation_response(normalized, in_order=in_order)
             update_state(
                 telefone,
@@ -361,11 +374,16 @@ class OrderAgent:
             }
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_COMPROVANTE:
-            if self._looks_like_receipt(text):
+            proof_analysis = self.payment_proof_agent.analyze(
+                text=text,
+                file_name=file_name,
+                mimetype=file_mimetype,
+            )
+            if proof_analysis["received"]:
                 update_state(
                     telefone,
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_CONFIRMACAO,
-                    aguardando_resposta="confirmacao",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO,
+                    aguardando_resposta="conferencia_pagamento",
                 )
                 refreshed = get_or_create_state(telefone)
                 return {
@@ -376,8 +394,8 @@ class OrderAgent:
                         "unit_price": refreshed.valor_unitario,
                         "total_price": refreshed.valor_total,
                     },
-                    "next_question": "Posso seguir com esse pedido? Se estiver tudo certo, me confirme por favor.",
-                    "response": self._build_order_summary(refreshed),
+                    "next_question": "O comprovante sera conferido antes da confirmacao do pedido.",
+                    "response": self._build_payment_proof_received_response(refreshed),
                 }
             return {
                 "state": asdict(state),
@@ -387,8 +405,28 @@ class OrderAgent:
                     "unit_price": state.valor_unitario,
                     "total_price": state.valor_total,
                 },
-                "next_question": "Pode enviar o comprovante por aqui assim que fizer o pagamento.",
-                "response": "Pode enviar o comprovante por aqui assim que fizer o pagamento.",
+                "next_question": "Envie o comprovante por imagem, PDF ou texto do comprovante.",
+                "response": (
+                    "Ainda preciso receber o comprovante para seguir com a conferencia do pagamento.\n\n"
+                    "Pode enviar por aqui como imagem, PDF ou texto do comprovante. "
+                    "Se preferir cancelar, digite cancelar."
+                ),
+            }
+
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO:
+            return {
+                "state": asdict(state),
+                "pricing": {
+                    "can_calculate": bool(state.valor_total),
+                    "needs_owner": False,
+                    "unit_price": state.valor_unitario,
+                    "total_price": state.valor_total,
+                },
+                "next_question": "Aguarde a conferencia do comprovante.",
+                "response": (
+                    "Seu comprovante ja foi recebido e esta aguardando conferencia. "
+                    "Assim que for validado, o pedido pode ser confirmado pela equipe."
+                ),
             }
 
         if self._wants_to_order(text):
@@ -448,6 +486,41 @@ class OrderAgent:
 
     def _wants_to_order(self, text: str) -> bool:
         return any(k in text for k in ["pedido", "pedir", "quero", "comprar", "marmita", "marmitex"])
+
+    def _is_explicit_order_request(self, normalized_text: str) -> bool:
+        if not any(product in normalized_text for product in ["marmitex", "marmita"]):
+            return False
+
+        price_only_terms = [
+            "quero saber",
+            "queria saber",
+            "gostaria de saber",
+            "qual o valor",
+            "quais os valores",
+            "qual os valores",
+            "me informa os valores",
+            "me passa os precos",
+            "tabela de preco",
+        ]
+        if any(term in normalized_text for term in price_only_terms):
+            return False
+
+        order_terms = [
+            "quero",
+            "vou querer",
+            "pode ser",
+            "separa",
+            "reservar",
+            "reserva",
+            "vou pedir",
+            "fazer pedido",
+            "fazer um pedido",
+        ]
+        if not any(term in normalized_text for term in order_terms):
+            return False
+
+        quantity_pattern = r"\b(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\b"
+        return bool(re.search(quantity_pattern, normalized_text))
 
     def _is_cancel_request(self, normalized_text: str) -> bool:
         return any(term in normalized_text for term in ["cancelar", "cancela", "quero cancelar", "cancelar pedido"])
@@ -540,34 +613,19 @@ class OrderAgent:
         normalized = self._normalize(text)
         items: list[dict] = []
         needs_owner = False
+        family_spans: list[tuple[int, int]] = []
 
-        # Marmitex individual: "2 marmitex", "duas marmitex", "marmitex"
+        number_pattern = r"\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez"
+
+        # Marmita familiar: aceita tambem "marmitex para duas pessoas",
+        # porque clientes usam os termos de forma intercambiavel no WhatsApp.
         for m in re.finditer(
-            r"(?:(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+)?marmitex(?:\s+individuais?)?",
+            rf"(?:(?P<qty>{number_pattern})\s+)?marmit(?:a|ex)(?:s)?\s+para\s+(?P<people>{number_pattern})\s+pessoas?",
             normalized,
         ):
-            qty_token = m.group(1) or "1"
-            qty = self._to_int(qty_token) or 1
-            unit = PRICE_TABLE["marmitex_individual"]
-            items.append(
-                {
-                    "produto": "marmitex individual",
-                    "produto_key": "marmitex_individual",
-                    "quantidade": qty,
-                    "valor_unitario": unit,
-                    "subtotal": round(qty * unit, 2),
-                }
-            )
-
-        # Marmita por pessoas: "uma marmita para 4 pessoas", "marmita para 2 pessoas"
-        for m in re.finditer(
-            r"(?:(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+)?marmita(?:s)?\s+para\s+(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+pessoas?",
-            normalized,
-        ):
-            order_qty_token = m.group(1) or "1"
-            people_token = m.group(2)
-            order_qty = self._to_int(order_qty_token) or 1
-            people = self._to_int(people_token) or 0
+            family_spans.append(m.span())
+            order_qty = self._to_int(m.group("qty") or "1") or 1
+            people = self._to_int(m.group("people")) or 0
 
             if people > 5:
                 needs_owner = True
@@ -591,6 +649,26 @@ class OrderAgent:
                 }
             )
 
+        # Marmitex/marmita individual: "2 marmitex", "duas marmitas".
+        # Ignora trechos ja capturados como marmita familiar.
+        for m in re.finditer(
+            rf"(?:(?P<qty>{number_pattern})\s+)?marmit(?:ex|a)(?:s)?(?:\s+individuais?)?",
+            normalized,
+        ):
+            if self._overlaps_any_span(m.span(), family_spans):
+                continue
+            qty = self._to_int(m.group("qty") or "1") or 1
+            unit = PRICE_TABLE["marmitex_individual"]
+            items.append(
+                {
+                    "produto": "marmitex individual",
+                    "produto_key": "marmitex_individual",
+                    "quantidade": qty,
+                    "valor_unitario": unit,
+                    "subtotal": round(qty * unit, 2),
+                }
+            )
+
         # Consolida itens iguais (se repetidos na mesma mensagem)
         grouped: dict[tuple[str, float], dict] = {}
         for item in items:
@@ -604,6 +682,10 @@ class OrderAgent:
                 )
 
         return {"items": list(grouped.values()), "needs_owner": needs_owner}
+
+    def _overlaps_any_span(self, span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
+        start, end = span
+        return any(start < other_end and end > other_start for other_start, other_end in spans)
 
     def _to_int(self, token: str) -> int | None:
         if not token:
@@ -646,6 +728,8 @@ class OrderAgent:
 
     def _is_price_followup(self, normalized_text: str, state) -> bool:
         if state.ultima_intencao != "consultar_valores":
+            return False
+        if self._is_explicit_order_request(normalized_text):
             return False
         return "marmitex" in normalized_text or "marmita" in normalized_text
 
@@ -891,6 +975,28 @@ class OrderAgent:
             f"- Total: {total}\n"
             "Posso seguir com esse pedido? Se estiver tudo certo, me confirme por favor."
         )
+
+    def _build_payment_proof_received_response(self, state) -> str:
+        total = f"R$ {state.valor_total:.2f}".replace(".", ",")
+        lines = [
+            "Comprovante recebido 😊",
+            "",
+            "Vou deixar o pagamento em conferencia. Por seguranca, ainda nao confirmo o pagamento automaticamente por aqui.",
+        ]
+        if state.itens_pedido:
+            item_lines = []
+            for item in state.itens_pedido:
+                subtotal = f"R$ {float(item['subtotal']):.2f}".replace(".", ",")
+                qty = int(item["quantidade"])
+                produto = self._pluralize_produto(item["produto"], qty)
+                item_lines.append(f"* {qty} {produto}: {subtotal}")
+            lines.extend(["", "Resumo do pedido:", *item_lines, f"Total: {total}"])
+        elif state.produto:
+            produto_legivel = self._human_product_name(state.produto, state.quantidade)
+            lines.extend(["", "Resumo do pedido:", f"* {produto_legivel}", f"Total: {total}"])
+        lines.append("")
+        lines.append("A equipe precisa validar o comprovante antes de confirmar o pedido.")
+        return "\n".join(lines)
 
     def _build_items_summary_response(self, items: list[dict], total: float, ask_address: bool) -> str:
         lines = ["Perfeito 😊 Seu pedido ficou assim:\n"]

@@ -77,9 +77,19 @@ def obter_historico(conversa: Conversa, limite: int = 20):
     return list(conversa.mensagens.order_by('-criado_em')[:limite][::-1])
 
 
-def gerar_resposta_atendimento(texto: str) -> str:
+def gerar_resposta_atendimento(
+    texto: str,
+    telefone: str = '',
+    file_name: str = '',
+    file_mimetype: str = '',
+) -> str:
     try:
-        result = orchestrator_agent.handle_message(texto)
+        result = orchestrator_agent.handle_message(
+            texto,
+            telefone=telefone,
+            file_name=file_name,
+            file_mimetype=file_mimetype,
+        )
         resposta = (result.get('final_response') or '').strip()
         if resposta:
             return resposta
@@ -108,7 +118,17 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
         telefone = msg.get('from', '')
         message_id = msg.get('id', '')
         tipo = msg.get('type')
-        texto = msg.get('text', {}).get('body', '').strip() if tipo == 'text' else ''
+        file_name = ''
+        file_mimetype = ''
+        texto = ''
+
+        if tipo == 'text':
+            texto = msg.get('text', {}).get('body', '').strip()
+        elif tipo in {'image', 'document'}:
+            media = msg.get(tipo, {}) or {}
+            file_name = media.get('filename') or media.get('id') or ''
+            file_mimetype = media.get('mime_type') or ''
+            texto = (media.get('caption') or '').strip() or 'Comprovante enviado'
 
         if not telefone:
             logger.warning('Mensagem recebida sem telefone.')
@@ -127,7 +147,12 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
                 logger.info('Conversa %s em modo humano, sem resposta automatica.', conversa.id)
                 return
 
-            resposta = gerar_resposta_atendimento(texto=texto)
+            resposta = gerar_resposta_atendimento(
+                texto=texto,
+                telefone=telefone,
+                file_name=file_name,
+                file_mimetype=file_mimetype,
+            )
             if not resposta:
                 resposta = responder_com_agente(cliente=cliente, conversa=conversa, texto=texto)
             if not resposta:

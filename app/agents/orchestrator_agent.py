@@ -94,7 +94,7 @@ class OrchestratorAgent:
         cardapio = self.cardapio_agent.get_cardapio()
         rag_result = self.rag_agent.search(message, top_k=4)
         rag_snippets = rag_result.get("results", [])
-        file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if file_name else None
+        file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if (file_name or file_mimetype) else None
 
         if (
             conversation_state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO
@@ -189,7 +189,12 @@ class OrchestratorAgent:
                     "final_response": f"O total do seu pedido e {total}.",
                 }
 
-            order_data = self.order_agent.process_message(phone_key, message)
+            order_data = self.order_agent.process_message(
+                phone_key,
+                message,
+                file_name=file_name,
+                file_mimetype=file_mimetype,
+            )
             return {
                 "intent": "fazer_pedido",
                 "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
@@ -356,6 +361,7 @@ class OrchestratorAgent:
             AtendimentoStatus.AGUARDANDO_ENDERECO,
             AtendimentoStatus.AGUARDANDO_PAGAMENTO,
             AtendimentoStatus.AGUARDANDO_COMPROVANTE,
+            AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO,
             AtendimentoStatus.AGUARDANDO_CONFIRMACAO,
         }
         in_order = state.status_atendimento in order_statuses or state.ultima_intencao == "fazer_pedido"
@@ -449,6 +455,8 @@ class OrchestratorAgent:
             return "Agora, para continuar seu pedido, qual sera a forma de pagamento? Pix, dinheiro ou cartao?"
         if state.forma_pagamento == "Pix" and state.status_atendimento == AtendimentoStatus.AGUARDANDO_COMPROVANTE:
             return "Agora, para continuar seu pedido, pode enviar o comprovante por aqui."
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO:
+            return "Seu comprovante ja foi recebido e esta aguardando conferencia."
         return "Agora, para continuar seu pedido, confirme se esta tudo certo, por favor."
 
     def _handle_menu_option(self, menu_option: str) -> str:
