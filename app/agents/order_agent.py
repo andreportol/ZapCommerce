@@ -2,7 +2,7 @@ import re
 import unicodedata
 from dataclasses import asdict
 
-from .conversation_state import AtendimentoStatus, get_or_create_state, update_state
+from .conversation_state import AtendimentoStatus, get_or_create_state, reset_state, update_state
 
 PRICE_TABLE = {
     "marmitex_individual": 21.00,
@@ -37,7 +37,70 @@ class OrderAgent:
         normalized = self._normalize(text)
         in_order = state.ultima_intencao == "fazer_pedido" or state.status_atendimento != AtendimentoStatus.INICIO
 
+        if self._is_cancel_request(normalized):
+            reset_state(telefone)
+            return {
+                "state": asdict(get_or_create_state(telefone)),
+                "pricing": {
+                    "can_calculate": False,
+                    "needs_owner": False,
+                    "unit_price": 0.0,
+                    "total_price": 0.0,
+                },
+                "next_question": "",
+                "response": "Pedido cancelado. Se precisar de algo mais, e so me chamar.",
+            }
+
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PAGAMENTO:
+            payment_choice = self._extract_payment(text)
+            if payment_choice:
+                update_state(telefone, forma_pagamento=payment_choice)
+                refreshed = get_or_create_state(telefone)
+                pricing = {
+                    "can_calculate": bool(refreshed.valor_total),
+                    "needs_owner": False,
+                    "unit_price": refreshed.valor_unitario,
+                    "total_price": refreshed.valor_total,
+                }
+                next_question = self._next_question(refreshed, pricing)
+                response = self._build_response(get_or_create_state(telefone), pricing, next_question)
+                return {
+                    "state": asdict(get_or_create_state(telefone)),
+                    "pricing": pricing,
+                    "next_question": next_question,
+                    "response": response,
+                }
+
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA:
+            if self._is_cancel_request(normalized):
+                reset_state(telefone)
+                return {
+                    "state": asdict(get_or_create_state(telefone)),
+                    "pricing": {
+                        "can_calculate": False,
+                        "needs_owner": False,
+                        "unit_price": 0.0,
+                        "total_price": 0.0,
+                    },
+                    "next_question": "",
+                    "response": "Pedido cancelado. Se precisar de algo mais, e so me chamar.",
+                }
+            if self._is_delivery_fee_question(normalized):
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": "Voce prefere:\n1 - Entrega\n2 - Retirada no local",
+                    "response": (
+                        "A taxa de entrega depende do endereco. "
+                        "Se voce escolher entrega, me envie o endereco que confirmamos certinho.\n\n"
+                        "Voce prefere:\n1 - Entrega\n2 - Retirada no local"
+                    ),
+                }
             if self._is_delivery_choice(normalized):
                 update_state(
                     telefone,
@@ -113,8 +176,29 @@ class OrderAgent:
                 "response": "Voce prefere:\n1 - Entrega\n2 - Retirada no local",
             }
 
-        if self._is_price_consultation(normalized):
+        if self._is_delivery_fee_question(normalized):
+            return {
+                "state": asdict(state),
+                "pricing": {
+                    "can_calculate": bool(state.valor_total),
+                    "needs_owner": False,
+                    "unit_price": state.valor_unitario,
+                    "total_price": state.valor_total,
+                },
+                "next_question": "",
+                "response": (
+                    "A taxa de entrega depende do endereco. "
+                    "Me envie o endereco de entrega para confirmarmos o valor certinho."
+                ),
+            }
+
+        if self._is_price_consultation(normalized) or self._is_price_followup(normalized, state):
             response = self._build_price_consultation_response(normalized, in_order=in_order)
+            update_state(
+                telefone,
+                ultima_intencao="consultar_valores",
+                status_atendimento=AtendimentoStatus.INICIO if not state.itens_pedido else state.status_atendimento,
+            )
             return {
                 "state": asdict(get_or_create_state(telefone)),
                 "pricing": {
@@ -331,8 +415,17 @@ class OrderAgent:
             update_state(telefone, forma_pagamento=payment)
 
         state = get_or_create_state(telefone)
-        pricing = self._calculate_price(state.produto, state.quantidade)
-        if pricing["can_calculate"]:
+        if state.itens_pedido and state.valor_total > 0:
+            pricing = {
+                "can_calculate": True,
+                "needs_owner": False,
+                "unit_price": state.valor_unitario,
+                "total_price": state.valor_total,
+            }
+        else:
+            pricing = self._calculate_price(state.produto, state.quantidade)
+
+        if pricing["can_calculate"] and not state.itens_pedido:
             update_state(
                 telefone,
                 valor_unitario=pricing["unit_price"],
@@ -355,6 +448,9 @@ class OrderAgent:
 
     def _wants_to_order(self, text: str) -> bool:
         return any(k in text for k in ["pedido", "pedir", "quero", "comprar", "marmita", "marmitex"])
+
+    def _is_cancel_request(self, normalized_text: str) -> bool:
+        return any(term in normalized_text for term in ["cancelar", "cancela", "quero cancelar", "cancelar pedido"])
 
     def _is_positive_confirmation(self, text: str) -> bool:
         normalized = self._normalize(text)
@@ -518,13 +614,20 @@ class OrderAgent:
         return NUMBER_WORDS.get(t)
 
     def _extract_payment(self, text: str) -> str:
-        if "pix" in text:
+        normalized = self._normalize(text)
+        if normalized in {"1", "pix"} or "pix" in normalized:
             return "Pix"
-        if "dinheiro" in text:
+        if normalized in {"2", "dinheiro"} or "dinheiro" in normalized:
             return "Dinheiro"
-        if "cartao" in text or "cartão" in text:
+        if normalized in {"3", "cartao"} or "cartao" in normalized:
             return "Cartao"
         return ""
+
+    def _is_delivery_fee_question(self, normalized_text: str) -> bool:
+        return (
+            "entrega" in normalized_text
+            and any(term in normalized_text for term in ["valor", "taxa", "preco", "quanto", "custa", "custo"])
+        )
 
     def _is_price_consultation(self, normalized_text: str) -> bool:
         triggers = [
@@ -540,6 +643,11 @@ class OrderAgent:
             "me passa os precos",
         ]
         return any(t in normalized_text for t in triggers)
+
+    def _is_price_followup(self, normalized_text: str, state) -> bool:
+        if state.ultima_intencao != "consultar_valores":
+            return False
+        return "marmitex" in normalized_text or "marmita" in normalized_text
 
     def _build_price_consultation_response(self, normalized_text: str, in_order: bool) -> str:
         lines: list[str] = []
@@ -703,6 +811,15 @@ class OrderAgent:
         if pricing.get("needs_owner"):
             return next_question
 
+        if state.itens_pedido and pricing.get("can_calculate"):
+            if state.endereco and not state.forma_pagamento:
+                return "Perfeito 😊 Endereco anotado. Qual sera a forma de pagamento? Pix, dinheiro ou cartao?"
+            if state.forma_pagamento and state.forma_pagamento != "Pix":
+                return self._build_order_summary(state)
+            if state.forma_pagamento == "Pix":
+                return f"Certo 😊 Pode enviar o comprovante por aqui assim que fizer o pagamento."
+            return next_question
+
         if (
             state.produto
             and state.quantidade
@@ -747,8 +864,25 @@ class OrderAgent:
         return "pedido"
 
     def _build_order_summary(self, state) -> str:
-        produto_legivel = self._human_product_name(state.produto, state.quantidade)
         total = f"R$ {state.valor_total:.2f}".replace(".", ",")
+        if state.itens_pedido:
+            item_lines = []
+            for item in state.itens_pedido:
+                subtotal = f"R$ {float(item['subtotal']):.2f}".replace(".", ",")
+                qty = int(item["quantidade"])
+                produto = self._pluralize_produto(item["produto"], qty)
+                item_lines.append(f"- {qty} {produto}: {subtotal}")
+            itens = "\n".join(item_lines)
+            return (
+                "Resumo do seu pedido:\n"
+                f"{itens}\n"
+                f"- Entrega: {state.endereco}\n"
+                f"- Forma de pagamento: {state.forma_pagamento}\n"
+                f"- Total: {total}\n"
+                "Posso seguir com esse pedido? Se estiver tudo certo, me confirme por favor."
+            )
+
+        produto_legivel = self._human_product_name(state.produto, state.quantidade)
         return (
             "Resumo do seu pedido:\n"
             f"- Produto: {produto_legivel}\n"

@@ -12,7 +12,7 @@ from .llm_config import LLMConfigError
 from .message_agent import MessageAgent
 from .order_agent import OrderAgent
 from .rag import RagAgent
-from .conversation_state import AtendimentoStatus, get_or_create_state, update_state
+from .conversation_state import AtendimentoStatus, get_or_create_state, reset_state, update_state
 
 
 class OrchestratorAgent:
@@ -55,6 +55,23 @@ class OrchestratorAgent:
     ) -> dict:
         phone_key = (telefone or "sessao_padrao").strip()
         conversation_state = get_or_create_state(phone_key)
+        if self._is_cancel_request(message):
+            has_order_context = bool(conversation_state.itens_pedido or conversation_state.produto or conversation_state.valor_total)
+            reset_state(phone_key)
+            return {
+                "intent": "cancelar",
+                "database": {"implemented": False, "message": "Cancelamento local de estado.", "data": None},
+                "instructions": self.instructions_agent.get_instructions(),
+                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+                "rag_results": [],
+                "file_info": None,
+                "final_response": (
+                    "Pedido cancelado. Se precisar de algo mais, e so me chamar."
+                    if has_order_context
+                    else "Nao ha pedido em andamento para cancelar. Se quiser, posso te ajudar com um novo pedido."
+                ),
+            }
+
         if (
             conversation_state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO
             and self._is_order_confirmation_from_offer(message)
@@ -121,6 +138,22 @@ class OrchestratorAgent:
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
                 "final_response": self._build_cardapio_response("hoje", cardapio),
+            }
+
+        if (
+            conversation_state.status_atendimento == AtendimentoStatus.INICIO
+            and self._is_explicit_start_order(message)
+        ):
+            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            return {
+                "intent": "fazer_pedido",
+                "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": order_data.get("state"),
+                "final_response": self._start_order_prompt(),
             }
 
         if self._is_order_flow_message(message, conversation_state):
@@ -199,6 +232,8 @@ class OrchestratorAgent:
         rule_response = self._response_from_rag_rules(message=message, cardapio=cardapio, rag_snippets=rag_snippets)
         if rule_response:
             final_response = rule_response
+            if self._is_price_question_context(message):
+                update_state(phone_key, ultima_intencao="consultar_valores")
         else:
             final_response = self._generate_final_response(
                 context=context,
@@ -216,6 +251,14 @@ class OrchestratorAgent:
             "file_info": file_info.__dict__ if file_info else None,
             "final_response": final_response,
         }
+
+    def _is_price_question_context(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return any(term in text for term in ["valor", "valores", "preco", "precos", "quanto custa", "custa"])
+
+    def _is_cancel_request(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return any(term in text for term in ["cancelar", "cancela", "quero cancelar", "cancelar pedido"])
 
     def _is_order_confirmation_from_offer(self, message: str) -> bool:
         text = self._normalize_short_text(message)
@@ -235,6 +278,17 @@ class OrchestratorAgent:
             "quero fazer pedido",
         }
         return text in confirmations
+
+    def _is_explicit_start_order(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return text in {
+            "quero fazer pedido",
+            "eu quero fazer pedido",
+            "eu quero fazer um pedido",
+            "quero pedir",
+            "gostaria de fazer pedido",
+            "gostaria de fazer um pedido",
+        }
 
     def _normalize_short_text(self, text: str) -> str:
         raw = (text or "").strip().lower()
