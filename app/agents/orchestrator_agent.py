@@ -41,6 +41,16 @@ class OrchestratorAgent:
         instructions = self.instructions_agent.get_instructions()
         cardapio = self.cardapio_agent.get_cardapio()
         file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if file_name else None
+        menu_response = self._handle_menu_option(analysis.menu_option)
+        if menu_response:
+            return {
+                "intent": analysis.intent,
+                "database": {"implemented": False, "message": "Fluxo de menu local.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": menu_response,
+            }
 
         if analysis.intent == "consultar pedido":
             db_result = self.database_agent.get_order_status(message)
@@ -66,6 +76,28 @@ class OrchestratorAgent:
             "file_info": file_info.__dict__ if file_info else None,
             "final_response": final_response,
         }
+
+    def _handle_menu_option(self, menu_option: str) -> str:
+        if menu_option == "1":
+            return (
+                "Perfeito! Para fazer seu pedido, me informe por favor:\n"
+                "o tipo de marmita desejada e a quantidade de pessoas.\n"
+                "Tambem me diga se e para entrega (com endereco) "
+                "ou se voce vai retirar no local, e qual sera a forma de pagamento."
+            )
+        if menu_option == "2":
+            return (
+                "Claro! Me diga o dia da semana que voce quer consultar "
+                "(por exemplo: segunda, terca, quarta...)."
+            )
+        if menu_option == "3":
+            return (
+                "Trabalhamos com marmitex individual e marmitas para 2, 3, 4 e 5 pessoas. "
+                "Para pedidos acima de 5 pessoas, preciso consultar a proprietaria."
+            )
+        if menu_option == "4":
+            return "Certo! Vou encaminhar seu atendimento para uma atendente. Aguarde um momento, por favor."
+        return ""
 
     def _build_context(
         self,

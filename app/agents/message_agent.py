@@ -9,6 +9,7 @@ from .llm_config import LLMConfigError
 class MessageAnalysis:
     intent: str
     original_message: str
+    menu_option: str = ""
 
 
 class MessageAgent:
@@ -33,7 +34,11 @@ class MessageAgent:
     def analyze(self, message: str) -> MessageAnalysis:
         message = (message or "").strip()
         if not message:
-            return MessageAnalysis(intent="duvida geral", original_message="")
+            return MessageAnalysis(intent="duvida geral", original_message="", menu_option="")
+
+        menu_option = self._extract_menu_option(message)
+        if menu_option:
+            return MessageAnalysis(intent=f"menu_opcao_{menu_option}", original_message=message, menu_option=menu_option)
 
         intent = self._classify_with_rules(message)
         if self._agent is not None:
@@ -49,7 +54,13 @@ class MessageAgent:
                     intent = llm_intent
             except Exception:
                 pass
-        return MessageAnalysis(intent=intent, original_message=message)
+        return MessageAnalysis(intent=intent, original_message=message, menu_option="")
+
+    def _extract_menu_option(self, message: str) -> str:
+        normalized = message.strip().lower()
+        if normalized in {"1", "2", "3", "4"}:
+            return normalized
+        return ""
 
     def _classify_with_rules(self, message: str) -> str:
         text = message.lower()
