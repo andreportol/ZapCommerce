@@ -67,8 +67,8 @@ class OrderAgent:
             type_choice = self._extract_marmita_type_choice(normalized)
             if type_choice is None:
                 clarification = (
-                    "Nao consegui identificar o tipo. "
-                    "Voce deseja marmitex individual ou marmita para 2, 3, 4 ou 5 pessoas?"
+                    "Não consegui identificar o tipo.\n\n"
+                    f"{self._marmita_type_prompt()}"
                 )
                 return {
                     "state": asdict(state),
@@ -154,6 +154,9 @@ class OrderAgent:
                     "total_price": refreshed.valor_total,
                 }
                 next_question = self._next_question(refreshed, pricing)
+                current_state = get_or_create_state(telefone)
+                aguardando = self._awaiting_field(current_state, pricing)
+                update_state(telefone, aguardando_resposta=aguardando)
                 response = self._build_response(get_or_create_state(telefone), pricing, next_question)
                 return {
                     "state": asdict(get_or_create_state(telefone)),
@@ -687,7 +690,7 @@ class OrderAgent:
                 tipo_entrega="retirada",
             )
             refreshed = get_or_create_state(telefone)
-            clarification = "Voce deseja marmitex individual ou marmita para 2, 3, 4 ou 5 pessoas?"
+            clarification = self._marmita_type_prompt()
             return {
                 "state": asdict(refreshed),
                 "pricing": {
@@ -702,13 +705,21 @@ class OrderAgent:
 
         if intencao in {"informar_endereco", "informar_entrega"} and in_order:
             if tipo_entrega == "entrega" and not endereco:
+                update_state(
+                    telefone,
+                    tipo_entrega="entrega",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_ENDERECO,
+                    aguardando_resposta="endereco",
+                    ultima_intencao="fazer_pedido",
+                )
+                refreshed = get_or_create_state(telefone)
                 return {
-                    "state": asdict(state),
+                    "state": asdict(refreshed),
                     "pricing": {
-                        "can_calculate": bool(state.valor_total),
+                        "can_calculate": bool(refreshed.valor_total),
                         "needs_owner": False,
-                        "unit_price": state.valor_unitario,
-                        "total_price": state.valor_total,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": refreshed.valor_total,
                     },
                     "next_question": "Pode me informar o endereco de entrega, por favor?",
                     "response": "Pode me informar o endereco de entrega, por favor?",
@@ -770,7 +781,7 @@ class OrderAgent:
                 update_fields["endereco"] = endereco
             update_state(telefone, **update_fields)
             refreshed = get_or_create_state(telefone)
-            clarification = "Voce deseja marmitex individual ou marmita para 2, 3, 4 ou 5 pessoas?"
+            clarification = self._marmita_type_prompt()
             return {
                 "state": asdict(refreshed),
                 "pricing": {
@@ -1677,21 +1688,26 @@ class OrderAgent:
         return "\n".join(lines)
 
     def _build_items_summary_response(self, items: list[dict], total: float, ask_address: bool) -> str:
-        lines = ["Perfeito 😊 Seu pedido ficou assim:\n"]
+        lines = ["Perfeito 😊 Seu pedido ficou assim:", ""]
         for item in items:
             subtotal = f"R$ {float(item['subtotal']):.2f}".replace(".", ",")
             qty = int(item["quantidade"])
             produto = item["produto"]
             produto_label = self._pluralize_produto(produto, qty)
             if qty == 1:
-                lines.append(f"* 1 {produto}: {subtotal}")
+                lines.append(f"• 1 {produto}: {subtotal}")
             else:
-                lines.append(f"* {qty} {produto_label}: {subtotal}")
+                lines.append(f"• {qty} {produto_label}: {subtotal}")
         total_str = f"R$ {float(total):.2f}".replace(".", ",")
-        lines.append(f"\nTotal: {total_str}")
+        lines.append("")
+        lines.append(f"Total: {total_str}")
         if ask_address:
-            lines.append("\nVoce prefere:\n1 - Entrega\n2 - Retirada no local")
-            lines.append("\nEntregas e retiradas acontecem das 11h às 13h.")
+            lines.append("")
+            lines.append("Você prefere:")
+            lines.append("1 - Entrega")
+            lines.append("2 - Retirada no local")
+            lines.append("")
+            lines.append("Entregas e retiradas acontecem das 11h às 13h.")
         return "\n".join(lines)
 
     def _pluralize_produto(self, produto: str, quantidade: int) -> str:
@@ -1699,7 +1715,19 @@ class OrderAgent:
             return produto
         if produto == "marmitex individual":
             return "marmitex individuais"
+        if produto.startswith("marmita para "):
+            return produto.replace("marmita para ", "marmitas para ", 1)
         return produto
+
+    def _marmita_type_prompt(self) -> str:
+        return (
+            "Você deseja:\n"
+            "1 - Marmitex individual\n"
+            "2 - Marmita para 2 pessoas\n"
+            "3 - Marmita para 3 pessoas\n"
+            "4 - Marmita para 4 pessoas\n"
+            "5 - Marmita para 5 pessoas"
+        )
 
 
 def run_order_agent_quantity_tests() -> dict:

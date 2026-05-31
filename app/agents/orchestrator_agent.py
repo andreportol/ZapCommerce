@@ -1,7 +1,9 @@
 import re
 import unicodedata
 import logging
+import os
 
+from django.conf import settings
 from django.utils import timezone
 
 from .base_agent import AgentExecutionError, create_base_agent, run_text
@@ -30,6 +32,7 @@ class OrchestratorAgent:
         self.order_agent = OrderAgent()
         self.database_agent = DatabaseAgent()
         self.file_agent = FileAgent()
+        self._force_open_hours_log_once = False
         self._llm_agent = None
         try:
             self._llm_agent = create_base_agent(
@@ -693,12 +696,30 @@ class OrchestratorAgent:
         return wants_order or (affirmative and in_order) or in_order
 
     def _is_open_for_orders(self) -> bool:
+        if self._is_force_open_hours_enabled():
+            return True
+        return self._is_within_business_hours_now()
+
+    def _is_within_business_hours_now(self) -> bool:
         now = timezone.localtime()
         is_monday_to_saturday = 0 <= now.weekday() <= 5
         current_minutes = (now.hour * 60) + now.minute
         opens_at = (9 * 60)
         closes_at = (12 * 60) + 30
         return is_monday_to_saturday and opens_at <= current_minutes <= closes_at
+
+    def _is_force_open_hours_enabled(self) -> bool:
+        force_open = (os.getenv("FORCE_OPEN_HOURS", "").strip().lower() == "true")
+        if not force_open:
+            return False
+        if not settings.DEBUG:
+            return False
+        if not self._force_open_hours_log_once:
+            logger.info(
+                "FORCE_OPEN_HOURS ativo em ambiente DEBUG: ignorando bloqueio de horario para testes."
+            )
+            self._force_open_hours_log_once = True
+        return True
 
     def _should_block_by_business_hours(self, message: str, state) -> bool:
         if self._is_open_for_orders():
@@ -751,6 +772,22 @@ class OrchestratorAgent:
         return any(term in normalized_text for term in terms)
 
     def _outside_business_hours_response(self, message: str) -> str:
+        normalized = self._normalize_short_text(message)
+        if self._is_reservation_intent(normalized) and self._extract_weekday(message):
+            return (
+                "Hoje não consigo registrar a encomenda, porque estamos fora do horário de pedidos.\n\n"
+                "Os pedidos/encomendas são feitos de segunda a sábado, das 9h às 12h30.\n\n"
+                "Posso te mostrar o cardápio de segunda-feira para você já escolher."
+            )
+        asserted_today = self._extract_asserted_today_weekday(message)
+        current_day = self._current_weekday_ptbr()
+        if asserted_today and asserted_today != current_day:
+            return (
+                f"{self._system_today_sentence()} "
+                "Mesmo assim, os pedidos/encomendas precisam ser feitos dentro do horário de atendimento:\n\n"
+                "Pedidos/encomendas: segunda a sábado, das 9h às 12h30.\n"
+                "Entregas e retiradas: das 11h às 13h."
+            )
         if self._is_greeting(message):
             return (
                 "Olá! No momento estamos fora do horário de pedidos.\n\n"
@@ -925,6 +962,16 @@ class OrchestratorAgent:
         normalized = self._normalize_short_text(message)
         if self._is_weekly_cardapio_request(normalized):
             return self._build_weekly_cardapio_response(cardapio)
+
+        asserted_today = self._extract_asserted_today_weekday(message or "")
+        current_day = self._current_weekday_ptbr()
+        if asserted_today and asserted_today != current_day:
+            suggested_day = asserted_today
+            return (
+                f"{self._system_today_sentence()}\n\n"
+                "Por isso, não há cardápio cadastrado para hoje.\n\n"
+                f"Posso te mostrar o cardápio de {self._display_weekday(suggested_day)} ou de outro dia da semana."
+            )
 
         day = self._extract_weekday(message or "")
         if respect_business_hours and not self._is_open_for_orders() and (not day or self._is_today_request(normalized)):
@@ -1208,6 +1255,25 @@ class OrchestratorAgent:
             if any(value in normalized for value in values):
                 return canonical
         return ""
+
+    def _extract_asserted_today_weekday(self, text: str) -> str:
+        normalized = self._normalize_short_text(text)
+        if "hoje" not in normalized:
+            return ""
+        if not any(
+            token in normalized
+            for token in ["hoje e", "hoje eh", "mas hoje e", "mas hoje eh", "hoje e", "hoje"]
+        ):
+            return ""
+        return self._extract_weekday(normalized)
+
+    def _is_reservation_intent(self, normalized_text: str) -> bool:
+        return any(term in normalized_text for term in ["reservar", "reserva", "encomenda", "encomendar"])
+
+    def _system_today_sentence(self) -> str:
+        current_day = self._current_weekday_ptbr()
+        current_date = timezone.localdate().strftime("%d/%m/%Y")
+        return f"Pelo sistema, hoje é {self._display_weekday(current_day)}, {current_date}."
 
     def _current_weekday_ptbr(self) -> str:
         mapping = {
