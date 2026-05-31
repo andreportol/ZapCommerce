@@ -1,6 +1,29 @@
 from django.contrib import admin
+from django.db import transaction
 
+from .agents.conversation_state import clear_all_states
 from .models import Cliente, ConfiguracaoMarmitaria, Conversa, ItemPedido, Mensagem, Pedido, Produto
+
+
+@admin.action(description='Limpar todo o historico de conversas')
+def limpar_todo_historico_conversas(modeladmin, request, queryset):
+    """
+    Limpa mensagens e estado local sem apagar clientes, conversas ou pedidos.
+
+    Deletar Conversa diretamente apagaria Pedido por cascata, entao esta acao
+    limpa apenas o historico de atendimento.
+    """
+    with transaction.atomic():
+        total_mensagens, _ = Mensagem.objects.all().delete()
+        total_conversas = Conversa.objects.update(
+            status=Conversa.Status.IA,
+            ultima_mensagem='',
+        )
+    clear_all_states()
+    modeladmin.message_user(
+        request,
+        f'Historico limpo: {total_mensagens} mensagens removidas e {total_conversas} conversas resetadas para IA.',
+    )
 
 
 @admin.register(Cliente)
@@ -33,6 +56,7 @@ class ConversaAdmin(admin.ModelAdmin):
     list_filter = ('status', 'atualizado_em')
     readonly_fields = ('criado_em', 'atualizado_em')
     inlines = [MensagemInline]
+    actions = [limpar_todo_historico_conversas]
 
 
 class ItemPedidoInline(admin.TabularInline):
@@ -57,6 +81,7 @@ class MensagemAdmin(admin.ModelAdmin):
     search_fields = ('texto', 'whatsapp_message_id', 'conversa__cliente__telefone')
     list_filter = ('origem', 'criado_em')
     readonly_fields = ('criado_em',)
+    actions = [limpar_todo_historico_conversas]
 
 
 @admin.register(ConfiguracaoMarmitaria)

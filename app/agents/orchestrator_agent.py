@@ -55,6 +55,7 @@ class OrchestratorAgent:
     ) -> dict:
         phone_key = (telefone or "sessao_padrao").strip()
         conversation_state = get_or_create_state(phone_key)
+
         if self._is_cancel_request(message):
             has_order_context = bool(conversation_state.itens_pedido or conversation_state.produto or conversation_state.valor_total)
             reset_state(phone_key)
@@ -70,6 +71,41 @@ class OrchestratorAgent:
                     if has_order_context
                     else "Nao ha pedido em andamento para cancelar. Se quiser, posso te ajudar com um novo pedido."
                 ),
+            }
+
+        if self._should_block_by_business_hours(message, conversation_state):
+            if conversation_state.status_atendimento != AtendimentoStatus.INICIO:
+                reset_state(phone_key)
+            return {
+                "intent": "fora_horario",
+                "database": {"implemented": False, "message": "Atendimento fora do horario de pedidos.", "data": None},
+                "instructions": self.instructions_agent.get_instructions(),
+                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+                "rag_results": [],
+                "file_info": None,
+                "final_response": self._outside_business_hours_response(message),
+            }
+
+        if self._is_new_order_request(message):
+            previous_status = conversation_state.status_atendimento
+            if previous_status != AtendimentoStatus.INICIO:
+                reset_state(phone_key)
+            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            prefix = "Certo, vou iniciar um novo pedido.\n\n"
+            if previous_status == AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO:
+                prefix = (
+                    "Certo, vou iniciar um novo pedido.\n"
+                    "O pedido anterior continua aguardando conferencia do comprovante pela equipe.\n\n"
+                )
+            return {
+                "intent": "fazer_pedido",
+                "database": {"implemented": False, "message": "Novo fluxo de pedido iniciado.", "data": None},
+                "instructions": self.instructions_agent.get_instructions(),
+                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+                "rag_results": self.rag_agent.search(message, top_k=2).get("results", []),
+                "file_info": None,
+                "order_state": order_data.get("state"),
+                "final_response": f"{prefix}{self._start_order_prompt()}",
             }
 
         if (
@@ -289,11 +325,34 @@ class OrchestratorAgent:
         return text in {
             "quero fazer pedido",
             "eu quero fazer pedido",
+            "quero fazer o pedido",
+            "eu quero fazer o pedido",
             "eu quero fazer um pedido",
             "quero pedir",
             "gostaria de fazer pedido",
             "gostaria de fazer um pedido",
+            "quero fazer encomenda",
+            "quero fazer uma encomenda",
+            "quero fazer um encomenda",
+            "gostaria de fazer encomenda",
+            "gostaria de fazer uma encomenda",
         }
+
+    def _is_new_order_request(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return any(
+            term in text
+            for term in [
+                "novo pedido",
+                "fazer novo pedido",
+                "fazer um novo pedido",
+                "quero fazer novo pedido",
+                "quero fazer um novo pedido",
+                "outro pedido",
+                "fazer outro pedido",
+                "quero outro pedido",
+            ]
+        )
 
     def _normalize_short_text(self, text: str) -> str:
         raw = (text or "").strip().lower()
@@ -343,11 +402,15 @@ class OrchestratorAgent:
                 "quero fazer pedido",
                 "quero pedir",
                 "gostaria de pedir",
-                "quero marmita",
-                "quero marmitex",
-                "marmita",
-                "marmitex",
-                "pedido",
+            "quero marmita",
+            "quero marmitex",
+            "encomenda",
+            "encomendar",
+            "quero encomenda",
+            "fazer encomenda",
+            "marmita",
+            "marmitex",
+            "pedido",
                 "pedir",
             ]
         )
@@ -357,6 +420,7 @@ class OrchestratorAgent:
             AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA,
             AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM,
             AtendimentoStatus.AGUARDANDO_PRODUTO,
+            AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA,
             AtendimentoStatus.AGUARDANDO_QUANTIDADE,
             AtendimentoStatus.AGUARDANDO_ENDERECO,
             AtendimentoStatus.AGUARDANDO_PAGAMENTO,
@@ -366,6 +430,80 @@ class OrchestratorAgent:
         }
         in_order = state.status_atendimento in order_statuses or state.ultima_intencao == "fazer_pedido"
         return wants_order or (affirmative and in_order) or in_order
+
+    def _is_open_for_orders(self) -> bool:
+        now = timezone.localtime()
+        is_monday_to_saturday = 0 <= now.weekday() <= 5
+        current_minutes = (now.hour * 60) + now.minute
+        opens_at = (9 * 60)
+        closes_at = (12 * 60) + 30
+        return is_monday_to_saturday and opens_at <= current_minutes <= closes_at
+
+    def _should_block_by_business_hours(self, message: str, state) -> bool:
+        if self._is_open_for_orders():
+            return False
+        text = self._normalize_short_text(message)
+        order_attempt = self._is_business_hours_order_attempt(text)
+        if self._is_menu_request_during_order(message, state):
+            return False
+        if state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO and not order_attempt:
+            return False
+        if state.status_atendimento != AtendimentoStatus.INICIO or state.ultima_intencao == "fazer_pedido":
+            return True
+        return self._is_greeting(message) or order_attempt
+
+    def _is_business_hours_order_attempt(self, normalized_text: str) -> bool:
+        if normalized_text == "1":
+            return True
+        terms = [
+            "pedido",
+            "pedir",
+            "fazer pedido",
+            "fazer o pedido",
+            "quero fazer pedido",
+            "quero fazer o pedido",
+            "encomenda",
+            "encomendar",
+            "fazer encomenda",
+            "fazer uma encomenda",
+            "quero fazer encomenda",
+            "quero fazer uma encomenda",
+            "quero marmitex",
+            "quero marmita",
+            "vou querer",
+            "reservar",
+            "reserva",
+        ]
+        return any(term in normalized_text for term in terms)
+
+    def _outside_business_hours_response(self, message: str) -> str:
+        if self._is_greeting(message):
+            return (
+                "Olá! No momento estamos fora do horário de pedidos.\n\n"
+                "Pedidos/encomendas: segunda a sábado, das 9h às 12h30.\n"
+                "Entregas e retiradas: das 11h às 13h.\n\n"
+                "Se quiser, posso te mostrar o cardápio. Para isso, digite 2."
+            )
+        return (
+            "No momento estamos fora do horário de pedidos.\n\n"
+            "Pedidos/encomendas: segunda a sábado, das 9h às 12h30.\n"
+            "Entregas e retiradas: das 11h às 13h.\n"
+            "Por favor, chame dentro desse horário para fazer sua encomenda."
+        )
+
+    def _is_greeting(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return text in {
+            "oi",
+            "ola",
+            "olá",
+            "bom dia",
+            "boa tarde",
+            "boa noite",
+            "oi bom dia",
+            "oi boa tarde",
+            "oi boa noite",
+        }
 
     def _is_total_price_question(self, message: str) -> bool:
         text = (message or "").strip().lower()
@@ -447,6 +585,8 @@ class OrchestratorAgent:
     def _order_continuation_prompt(self, state) -> str:
         if not state.itens_pedido and not state.produto:
             return "Agora, para continuar seu pedido, voce deseja marmitex individual ou marmita para quantas pessoas?"
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA:
+            return "Agora, para continuar seu pedido, me diga para quantas pessoas e a marmita."
         if not state.tipo_entrega:
             return "Agora, para continuar seu pedido, voce prefere entrega ou retirada no local?"
         if state.tipo_entrega == "entrega" and not state.endereco:

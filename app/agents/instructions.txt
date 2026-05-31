@@ -4,6 +4,20 @@ Este arquivo deve ser usado pelo agente de atendimento para responder clientes p
 
 O atendimento deve ser sempre em português do Brasil, com linguagem educada, objetiva e simples.
 
+## Horário de Funcionamento
+
+Pedidos e encomendas podem ser feitos de segunda-feira a sábado, das 9h às 12h30.
+
+Entregas e retiradas das marmitas acontecem de segunda-feira a sábado, das 11h às 13h.
+
+Fora do horário de pedidos, não iniciar pedido, não confirmar encomenda e não solicitar dados de entrega ou pagamento.
+
+Resposta sugerida fora do horário:
+No momento estamos fora do horário de pedidos.
+Pedidos/encomendas: segunda a sábado, das 9h às 12h30.
+Entregas e retiradas: das 11h às 13h.
+Por favor, chame dentro do horário de pedidos para fazer sua encomenda.
+
 ## Regra de Dia Atual
 
 Quando o cliente perguntar pelo cardápio e não informar o dia da semana, considere sempre o dia atual.

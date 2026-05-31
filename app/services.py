@@ -98,6 +98,33 @@ def gerar_resposta_atendimento(
     return ''
 
 
+def deve_encaminhar_para_humano(texto: str, resposta: str) -> bool:
+    texto_normalizado = (texto or '').strip().lower()
+    resposta_normalizada = (resposta or '').strip().lower()
+
+    if any(
+        termo in texto_normalizado
+        for termo in [
+            'falar com atendente',
+            'atendente',
+            'humano',
+            'pessoa',
+            'falar com alguem',
+            'falar com alguém',
+        ]
+    ):
+        return True
+
+    return (
+        'encaminhar' in resposta_normalizada
+        and (
+            'atendente' in resposta_normalizada
+            or 'pessoa da equipe' in resposta_normalizada
+            or 'atendimento humano' in resposta_normalizada
+        )
+    )
+
+
 def processar_mensagem_whatsapp(payload: dict) -> None:
     """
     Em producao, mover este processamento para Celery + Redis para evitar bloquear o webhook.
@@ -159,6 +186,14 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
                 return
 
             salvar_mensagem(conversa, Mensagem.Origem.IA, resposta)
+            if deve_encaminhar_para_humano(texto=texto, resposta=resposta):
+                conversa.status = Conversa.Status.HUMANO
+                conversa.save(update_fields=['status', 'atualizado_em'])
+                salvar_mensagem(
+                    conversa=conversa,
+                    origem=Mensagem.Origem.SISTEMA,
+                    texto='Conversa encaminhada para atendimento humano.',
+                )
 
         try:
             enviar_mensagem_whatsapp(telefone=telefone, texto=resposta)

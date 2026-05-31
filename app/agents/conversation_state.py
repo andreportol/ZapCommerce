@@ -7,6 +7,7 @@ class ConversationState:
     status_atendimento: str = "inicio"
     ultima_intencao: str = ""
     itens_pedido: list[dict] = field(default_factory=list)
+    itens_pendentes: list[dict] = field(default_factory=list)
     tipo_entrega: str = ""
     produto: str = ""
     quantidade: int = 0
@@ -25,6 +26,7 @@ class AtendimentoStatus:
     AGUARDANDO_TIPO_ENTREGA = "aguardando_tipo_entrega"
     AGUARDANDO_CONFIRMACAO_ITEM = "aguardando_confirmacao_item"
     AGUARDANDO_PRODUTO = "aguardando_produto"
+    AGUARDANDO_PESSOAS_MARMITA = "aguardando_pessoas_marmita"
     AGUARDANDO_QUANTIDADE = "aguardando_quantidade"
     AGUARDANDO_ENDERECO = "aguardando_endereco"
     AGUARDANDO_PAGAMENTO = "aguardando_pagamento"
@@ -71,6 +73,10 @@ def delete_state(telefone: str) -> None:
     phone = (telefone or "").strip()
     if phone:
         _CONVERSATION_MEMORY.pop(phone, None)
+
+
+def clear_all_states() -> None:
+    _CONVERSATION_MEMORY.clear()
 
 
 def state_to_dict(telefone: str) -> dict:
