@@ -24,9 +24,11 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS('Configuracao criada.' if created else 'Configuracao ja existia.'))
 
         produtos = [
-            ('Marmita pequena', 'Marmita pequena tradicional', Decimal('18.00'), Produto.Categoria.MARMITA_PEQUENA),
-            ('Marmita media', 'Marmita media tradicional', Decimal('22.00'), Produto.Categoria.MARMITA_MEDIA),
-            ('Marmita grande', 'Marmita grande tradicional', Decimal('27.00'), Produto.Categoria.MARMITA_GRANDE),
+            ('Marmitex individual', 'Opcao individual', Decimal('21.00'), Produto.Categoria.MARMITA_PEQUENA),
+            ('Marmita para 2 pessoas', 'Opcao para 2 pessoas', Decimal('65.00'), Produto.Categoria.MARMITA_MEDIA),
+            ('Marmita para 3 pessoas', 'Opcao para 3 pessoas', Decimal('85.00'), Produto.Categoria.MARMITA_MEDIA),
+            ('Marmita para 4 pessoas', 'Opcao para 4 pessoas', Decimal('105.00'), Produto.Categoria.MARMITA_GRANDE),
+            ('Marmita para 5 pessoas', 'Opcao para 5 pessoas', Decimal('125.00'), Produto.Categoria.MARMITA_GRANDE),
             ('Refrigerante lata', 'Lata 350ml', Decimal('6.00'), Produto.Categoria.BEBIDA),
             ('Agua mineral', 'Garrafa 500ml', Decimal('4.00'), Produto.Categoria.BEBIDA),
             ('Ovo adicional', 'Unidade', Decimal('2.50'), Produto.Categoria.ADICIONAL),

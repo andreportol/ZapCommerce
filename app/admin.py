@@ -2,13 +2,13 @@ from django.contrib import admin
 from django.db import transaction
 
 from .agents.conversation_state import clear_all_states
-from .models import Cliente, ConfiguracaoMarmitaria, Conversa, ItemPedido, Mensagem, Pedido, Produto
+from .models import Cliente, ConfiguracaoMarmitaria, Conversa, EstadoConversa, ItemPedido, Mensagem, Pedido, Produto
 
 
 @admin.action(description='Limpar todo o historico de conversas')
 def limpar_todo_historico_conversas(modeladmin, request, queryset):
     """
-    Limpa mensagens e estado local sem apagar clientes, conversas ou pedidos.
+    Limpa mensagens e estado persistido sem apagar clientes, conversas ou pedidos.
 
     Deletar Conversa diretamente apagaria Pedido por cascata, entao esta acao
     limpa apenas o historico de atendimento.
@@ -49,13 +49,20 @@ class MensagemInline(admin.TabularInline):
     show_change_link = True
 
 
+class EstadoConversaInline(admin.StackedInline):
+    model = EstadoConversa
+    extra = 0
+    can_delete = False
+    readonly_fields = ('criado_em', 'atualizado_em')
+
+
 @admin.register(Conversa)
 class ConversaAdmin(admin.ModelAdmin):
     list_display = ('id', 'cliente', 'status', 'ultima_mensagem', 'atualizado_em')
     search_fields = ('cliente__nome', 'cliente__telefone', 'ultima_mensagem')
     list_filter = ('status', 'atualizado_em')
     readonly_fields = ('criado_em', 'atualizado_em')
-    inlines = [MensagemInline]
+    inlines = [MensagemInline, EstadoConversaInline]
     actions = [limpar_todo_historico_conversas]
 
 
@@ -89,4 +96,12 @@ class ConfiguracaoMarmitariaAdmin(admin.ModelAdmin):
     list_display = ('id', 'nome_empresa', 'telefone_atendimento', 'taxa_entrega_padrao', 'ativo', 'atualizado_em')
     search_fields = ('nome_empresa', 'telefone_atendimento')
     list_filter = ('ativo',)
+    readonly_fields = ('criado_em', 'atualizado_em')
+
+
+@admin.register(EstadoConversa)
+class EstadoConversaAdmin(admin.ModelAdmin):
+    list_display = ('id', 'conversa', 'status_atendimento', 'ultima_intencao', 'forma_pagamento', 'atualizado_em')
+    search_fields = ('conversa__cliente__telefone', 'conversa__cliente__nome', 'endereco')
+    list_filter = ('status_atendimento', 'forma_pagamento', 'atualizado_em')
     readonly_fields = ('criado_em', 'atualizado_em')

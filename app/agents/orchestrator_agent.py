@@ -1,5 +1,6 @@
 import re
 import unicodedata
+import logging
 
 from django.utils import timezone
 
@@ -13,6 +14,9 @@ from .message_agent import MessageAgent
 from .order_agent import OrderAgent
 from .rag import RagAgent
 from .conversation_state import AtendimentoStatus, get_or_create_state, reset_state, update_state
+from app.order_catalog import format_brl, get_order_product, get_order_product_by_people, get_order_product_choices, list_order_products
+
+logger = logging.getLogger(__name__)
 
 
 class OrchestratorAgent:
@@ -166,12 +170,49 @@ class OrchestratorAgent:
                 "final_response": response,
             }
 
-        analysis = self.message_agent.analyze(message)
+        analysis = self.message_agent.analyze(
+            message,
+            state_summary=self._build_intent_state_summary(conversation_state),
+        )
         instructions = self.instructions_agent.get_instructions()
         cardapio = self.cardapio_agent.get_cardapio()
         rag_result = self.rag_agent.search(message, top_k=4)
         rag_snippets = rag_result.get("results", [])
         file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if (file_name or file_mimetype) else None
+
+        logger.info(
+            "Message analysis message=%r legacy_intent=%s new_intent=%s confidence=%.2f needs_confirmation=%s "
+            "produto=%r quantidade=%r tipo_entrega=%r endereco=%r",
+            message,
+            analysis.intent,
+            analysis.intencao,
+            analysis.confianca,
+            analysis.precisa_confirmacao,
+            analysis.produto,
+            analysis.quantidade,
+            analysis.tipo_entrega,
+            analysis.endereco,
+        )
+
+        if (
+            analysis.intencao != "desconhecida"
+            and analysis.confianca >= 0.55
+            and not analysis.precisa_confirmacao
+        ):
+            simple_route = self._route_structured_intent(
+                analysis=analysis,
+                message=message,
+                phone_key=phone_key,
+                conversation_state=conversation_state,
+                instructions=instructions,
+                cardapio=cardapio,
+                rag_snippets=rag_snippets,
+                file_info=file_info,
+                file_name=file_name,
+                file_mimetype=file_mimetype,
+            )
+            if simple_route is not None:
+                return simple_route
 
         if self._is_price_question_context(message) or self._is_price_followup_context(message, conversation_state):
             final_response = self._build_price_response(message)
@@ -216,14 +257,22 @@ class OrchestratorAgent:
                 "cardapio_loaded": bool(cardapio),
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
-                "final_response": self._build_cardapio_response(cardapio_message, cardapio),
+                "final_response": self._build_cardapio_response(
+                    cardapio_message,
+                    cardapio,
+                    respect_business_hours=False,
+                ),
             }
 
         if (
             conversation_state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO
             and self._is_cardapio_followup(message)
         ):
-            cardapio_response = self._build_cardapio_response(message, cardapio)
+            cardapio_response = self._build_cardapio_response(
+                message,
+                cardapio,
+                respect_business_hours=False,
+            )
             return {
                 "intent": "consultando_cardapio",
                 "database": {"implemented": False, "message": "Consulta local de cardapio.", "data": None},
@@ -315,6 +364,7 @@ class OrchestratorAgent:
             order_data = self.order_agent.process_message(
                 phone_key,
                 message,
+                structured_analysis=analysis.structured,
                 file_name=file_name,
                 file_mimetype=file_mimetype,
             )
@@ -382,6 +432,122 @@ class OrchestratorAgent:
             "file_info": file_info.__dict__ if file_info else None,
             "final_response": final_response,
         }
+
+    def _route_structured_intent(
+        self,
+        analysis,
+        message: str,
+        phone_key: str,
+        conversation_state,
+        instructions: str,
+        cardapio: str,
+        rag_snippets: list[dict],
+        file_info,
+        file_name: str,
+        file_mimetype: str,
+    ) -> dict | None:
+        if analysis.intencao == "consultar_cardapio":
+            update_state(
+                phone_key,
+                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+                aguardando_resposta="cardapio",
+            )
+            cardapio_message = analysis.mensagem_livre or message
+            return {
+                "intent": "consultando_cardapio",
+                "database": {"implemented": False, "message": "Consulta local de cardapio via intencao estruturada.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": self._build_cardapio_response(
+                    cardapio_message,
+                    cardapio,
+                    respect_business_hours=False,
+                ),
+            }
+
+        if analysis.intencao == "consultar_preco":
+            final_response = self._build_price_response(message)
+            if not self._is_open_for_orders():
+                final_response = self._adjust_price_response_outside_business_hours(final_response)
+                update_state(
+                    phone_key,
+                    status_atendimento=AtendimentoStatus.FORA_HORARIO,
+                    ultima_intencao="consultar_valores",
+                    aguardando_resposta="fora_horario",
+                )
+            else:
+                update_state(phone_key, ultima_intencao="consultar_valores")
+            return {
+                "intent": "consultar_valores",
+                "database": {"implemented": False, "message": "Consulta local de valores via intencao estruturada.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": final_response,
+            }
+
+        if analysis.intencao == "falar_atendente":
+            return {
+                "intent": "atendimento_humano",
+                "database": {"implemented": False, "message": "Encaminhamento para humano via intencao estruturada.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": "Certo! Vou encaminhar seu atendimento para uma atendente. Aguarde um momento, por favor.",
+            }
+
+        if analysis.intencao == "cancelar_pedido":
+            has_order_context = bool(
+                conversation_state.itens_pedido
+                or conversation_state.produto
+                or conversation_state.valor_total
+            )
+            reset_state(phone_key)
+            return {
+                "intent": "cancelar",
+                "database": {"implemented": False, "message": "Cancelamento local de estado via intencao estruturada.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": (
+                    "Pedido cancelado. Se precisar de algo mais, e so me chamar."
+                    if has_order_context
+                    else "Nao ha pedido em andamento para cancelar. Se quiser, posso te ajudar com um novo pedido."
+                ),
+            }
+
+        if analysis.intencao in {"informar_retirada", "informar_endereco"}:
+            if not self._is_order_flow_message(message, conversation_state):
+                return None
+            forwarded_message = message
+            if analysis.intencao == "informar_retirada":
+                forwarded_message = "retirada"
+            elif analysis.intencao == "informar_endereco" and analysis.endereco:
+                forwarded_message = f"entrega na {analysis.endereco}"
+            order_data = self.order_agent.process_message(
+                phone_key,
+                forwarded_message,
+                structured_analysis=analysis.structured,
+                file_name=file_name,
+                file_mimetype=file_mimetype,
+            )
+            return {
+                "intent": "fazer_pedido",
+                "database": {"implemented": False, "message": "Fluxo de pedido em andamento via intencao estruturada.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": order_data.get("state"),
+                "final_response": order_data.get("response", ""),
+            }
+
+        return None
 
     def _is_price_question_context(self, message: str) -> bool:
         text = self._normalize_short_text(message)
@@ -451,16 +617,19 @@ class OrchestratorAgent:
         return re.sub(r"\s+", " ", raw).strip()
 
     def _start_order_prompt(self) -> str:
-        return (
-            "Perfeito 😊 Vamos fazer seu pedido.\n\n"
-            "Voce deseja:\n"
-            "1 - Marmitex individual\n"
-            "2 - Marmita para 2 pessoas\n"
-            "3 - Marmita para 3 pessoas\n"
-            "4 - Marmita para 4 pessoas\n"
-            "5 - Marmita para 5 pessoas\n\n"
-            'Ou, se preferir, me diga direto a quantidade. Exemplo: "quero 3 marmitex".'
-        )
+        choices = get_order_product_choices()
+        if not choices:
+            return (
+                "No momento nao ha produtos de pedido disponiveis no catalogo. "
+                "Se quiser, posso te encaminhar para a atendente."
+            )
+
+        lines = ["Perfeito 😊 Vamos fazer seu pedido.", "", "Voce deseja:"]
+        for item in choices:
+            lines.append(f"{item['choice']} - {item['nome']}")
+        lines.append("")
+        lines.append('Ou, se preferir, me diga direto a quantidade. Exemplo: "quero 3 marmitex".')
+        return "\n".join(lines)
 
     def _maybe_mark_awaiting_order_confirmation(self, telefone: str, response: str) -> None:
         text = (response or "").lower()
@@ -492,6 +661,8 @@ class OrchestratorAgent:
                 "quero fazer pedido",
                 "quero pedir",
                 "gostaria de pedir",
+            "manda",
+            "mandar",
             "quero marmita",
             "quero marmitex",
             "encomenda",
@@ -622,35 +793,37 @@ class OrchestratorAgent:
         lines: list[str] = []
 
         if "marmitex" in text:
-            lines.append("A marmitex individual custa R$ 21,00.")
+            product = get_order_product("marmitex_individual", only_available=True)
+            if product is not None:
+                lines.append(f"A marmitex individual custa {format_brl(product['preco'])}.")
+            else:
+                lines.append("No momento a marmitex individual nao esta disponivel.")
 
-        people_prices = {
-            2: "R$ 65,00",
-            3: "R$ 85,00",
-            4: "R$ 105,00",
-            5: "R$ 125,00",
-        }
-        for people, price in people_prices.items():
+        for people in [2, 3, 4, 5]:
             aliases = {str(people), self._number_word(people)}
             if any(
                 f"marmita para {alias} pessoas" in text
                 or f"marmita para {alias} pessoa" in text
                 for alias in aliases
             ):
-                lines.append(f"A marmita para {people} pessoas custa {price}.")
+                product = get_order_product_by_people(people, only_available=True)
+                if product is not None:
+                    lines.append(f"A marmita para {people} pessoas custa {format_brl(product['preco'])}.")
+                else:
+                    lines.append(f"No momento a marmita para {people} pessoas nao esta disponivel.")
 
         if lines:
             return "\n".join(lines)
 
-        return (
-            "Nossos valores sao:\n\n"
-            "* Marmitex individual: R$ 21,00\n"
-            "* Marmita para 2 pessoas: R$ 65,00\n"
-            "* Marmita para 3 pessoas: R$ 85,00\n"
-            "* Marmita para 4 pessoas: R$ 105,00\n"
-            "* Marmita para 5 pessoas: R$ 125,00\n\n"
-            "Para pedidos acima de 5 pessoas, preciso consultar a proprietaria."
-        )
+        available_products = list_order_products(only_available=True)
+        if not available_products:
+            return "No momento nao ha opcoes de pedido disponiveis no catalogo."
+
+        response_lines = ["Nossos valores sao:", ""]
+        for product in available_products:
+            response_lines.append(f"* {product['nome']}: {format_brl(product['preco'])}")
+        response_lines.extend(["", "Para pedidos acima de 5 pessoas, preciso consultar a proprietaria."])
+        return "\n".join(response_lines)
 
     def _is_price_followup_context(self, message: str, state) -> bool:
         if state.ultima_intencao != "consultar_valores":
@@ -765,7 +938,7 @@ class OrchestratorAgent:
 
         day_menu = self._extract_day_menu(cardapio, day)
         if not day_menu:
-            return "Nao encontrei cardápio cadastrado para esse dia. Pode me dizer outro dia da semana?"
+            return "Não encontrei cardápio cadastrado para esse dia. Você deseja consultar outro dia da semana?"
         return f"{prefix}\n\n{day_menu}"
 
     def _cardapio_after_hours_response(self) -> str:
@@ -869,20 +1042,19 @@ class OrchestratorAgent:
 
     def _handle_menu_option(self, menu_option: str) -> str:
         if menu_option == "1":
-            return (
-                "Perfeito! Para fazer seu pedido, me informe por favor:\n"
-                "o tipo de marmita desejada e a quantidade de pessoas.\n"
-                "Tambem me diga se e para entrega (com endereco) "
-                "ou se voce vai retirar no local, e qual sera a forma de pagamento."
-            )
+            return self._start_order_prompt()
         if menu_option == "2":
             return (
                 "Claro! Me diga o dia da semana que voce quer consultar "
                 "(por exemplo: segunda, terca, quarta...)."
             )
         if menu_option == "3":
+            available_products = list_order_products(only_available=True)
+            if not available_products:
+                return "No momento nao ha opcoes de pedido disponiveis no catalogo."
+            product_names = ", ".join(product["nome"] for product in available_products)
             return (
-                "Trabalhamos com marmitex individual e marmitas para 2, 3, 4 e 5 pessoas. "
+                f"No momento trabalhamos com: {product_names}. "
                 "Para pedidos acima de 5 pessoas, preciso consultar a proprietaria."
             )
         if menu_option == "4":
@@ -923,6 +1095,20 @@ class OrchestratorAgent:
             "Gere apenas a resposta final para o usuario em 1 a 4 frases curtas."
         )
 
+    def _build_intent_state_summary(self, state) -> dict:
+        return {
+            "status_atendimento": state.status_atendimento,
+            "ultima_intencao": state.ultima_intencao,
+            "aguardando_resposta": state.aguardando_resposta,
+            "pedido_atual": {
+                "produto": state.produto or None,
+                "quantidade": state.quantidade or None,
+                "tipo_entrega": state.tipo_entrega or None,
+                "endereco": state.endereco or None,
+                "forma_pagamento": state.forma_pagamento or None,
+            },
+        }
+
     def _generate_final_response(self, context: str, intent: str, has_file: bool, rag_snippets: list[dict]) -> str:
         if not rag_snippets:
             return (
@@ -961,10 +1147,11 @@ class OrchestratorAgent:
     def _response_from_rag_rules(self, message: str, cardapio: str, rag_snippets: list[dict]) -> str:
         msg = message.lower()
         rag_text = " ".join(item.get("text", "") for item in rag_snippets).lower()
+        normalized_msg = self._normalize_short_text(message)
 
-        if "marmitex" in msg and ("custa" in msg or "valor" in msg or "preco" in msg or "preço" in msg):
-            if "r$ 21,00" in rag_text or "r$ 21,00" in cardapio.lower() or "r$ 21,00" in rag_text.replace(" ", ""):
-                return "A marmitex individual custa R$ 21,00."
+        if any(term in normalized_msg for term in ["valor", "valores", "preco", "precos", "quanto custa", "custa"]):
+            if "marmitex" in normalized_msg or "marmita" in normalized_msg:
+                return self._build_price_response(message)
 
         people_count = self._extract_people_count(msg)
         if people_count is not None:
@@ -979,7 +1166,6 @@ class OrchestratorAgent:
                 if value:
                     return f"A marmita para {people_count} pessoas custa {value}."
 
-        normalized_msg = self._normalize_short_text(message)
         if "cardapio" in normalized_msg:
             if self._is_weekly_cardapio_request(normalized_msg):
                 return self._build_weekly_cardapio_response(cardapio)

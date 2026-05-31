@@ -62,6 +62,28 @@ class Conversa(BaseTimestampModel):
         return f'Conversa {self.id} - {self.cliente}'
 
 
+class EstadoConversa(BaseTimestampModel):
+    conversa = models.OneToOneField(Conversa, on_delete=models.CASCADE, related_name='estado_fluxo')
+    status_atendimento = models.CharField(max_length=50, default='inicio')
+    ultima_intencao = models.CharField(max_length=50, blank=True)
+    itens_pedido = models.JSONField(default=list, blank=True)
+    itens_pendentes = models.JSONField(default=list, blank=True)
+    tipo_entrega = models.CharField(max_length=30, blank=True)
+    produto = models.CharField(max_length=50, blank=True)
+    quantidade = models.PositiveIntegerField(default=0)
+    valor_unitario = models.FloatField(default=0.0)
+    valor_total = models.FloatField(default=0.0)
+    endereco = models.CharField(max_length=255, blank=True)
+    forma_pagamento = models.CharField(max_length=30, blank=True)
+    aguardando_resposta = models.CharField(max_length=50, blank=True)
+
+    class Meta:
+        ordering = ['-atualizado_em']
+
+    def __str__(self):
+        return f'Estado da conversa {self.conversa_id}'
+
+
 class Mensagem(models.Model):
     class Origem(models.TextChoices):
         CLIENTE = 'cliente', 'Cliente'

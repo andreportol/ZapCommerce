@@ -3,15 +3,8 @@ import unicodedata
 from dataclasses import asdict
 
 from .conversation_state import AtendimentoStatus, get_or_create_state, reset_state, update_state
+from app.order_catalog import format_brl, get_order_product, get_order_product_by_people, get_order_product_choices, list_order_products
 from .payment_proof_agent import PaymentProofAgent
-
-PRICE_TABLE = {
-    "marmitex_individual": 21.00,
-    "marmita_2_pessoas": 65.00,
-    "marmita_3_pessoas": 85.00,
-    "marmita_4_pessoas": 105.00,
-    "marmita_5_pessoas": 125.00,
-}
 
 NUMBER_WORDS = {
     "um": 1,
@@ -39,9 +32,18 @@ class OrderAgent:
         self,
         telefone: str,
         message: str,
+        structured_analysis: dict | None = None,
         file_name: str = "",
         file_mimetype: str = "",
     ) -> dict:
+        structured_result = self.process_structured_input(
+            telefone=telefone,
+            message=message,
+            structured_analysis=structured_analysis,
+        )
+        if structured_result is not None:
+            return structured_result
+
         state = get_or_create_state(telefone)
         text = (message or "").strip().lower()
         normalized = self._normalize(text)
@@ -61,13 +63,40 @@ class OrderAgent:
                 "response": "Pedido cancelado. Se precisar de algo mais, e so me chamar.",
             }
 
-        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PRODUTO and normalized in {"1", "2", "3", "4", "5"}:
+        if self._is_waiting_marmita_type(state):
+            type_choice = self._extract_marmita_type_choice(normalized)
+            if type_choice is None:
+                clarification = (
+                    "Nao consegui identificar o tipo. "
+                    "Voce deseja marmitex individual ou marmita para 2, 3, 4 ou 5 pessoas?"
+                )
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": False,
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": clarification,
+                    "response": clarification,
+                }
+
+            qty = max(1, int(state.quantidade or 1))
+            item = self._make_item_from_key(type_choice, qty)
+            if item is None:
+                return self._catalog_unavailable_response(telefone, "marmita selecionada")
+            return self._apply_item_with_current_delivery_context(telefone, [item])
+
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PRODUTO and normalized.isdigit():
             return self._handle_product_menu_choice(telefone, normalized)
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_QUANTIDADE and state.produto == "marmitex_individual":
             qty = self._to_int(normalized)
             if qty:
                 item = self._make_item("marmitex individual", "marmitex_individual", qty)
+                if item is None:
+                    return self._catalog_unavailable_response(telefone, "Marmitex individual")
                 return self._apply_order_items(telefone, [item])
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA:
@@ -92,13 +121,14 @@ class OrderAgent:
                     }
                 if people in {2, 3, 4, 5}:
                     pending_items = list(state.itens_pendentes or [])
-                    pending_items.append(
-                        self._make_item(
-                            produto=f"marmita para {people} pessoas",
-                            produto_key=f"marmita_{people}_pessoas",
-                            quantidade=max(1, int(state.quantidade or 1)),
-                        )
+                    item = self._make_item(
+                        produto=f"marmita para {people} pessoas",
+                        produto_key=f"marmita_{people}_pessoas",
+                        quantidade=max(1, int(state.quantidade or 1)),
                     )
+                    if item is None:
+                        return self._catalog_unavailable_response(telefone, f"Marmita para {people} pessoas")
+                    pending_items.append(item)
                     return self._apply_order_items(telefone, pending_items, clear_pending=True)
             return {
                 "state": asdict(state),
@@ -574,11 +604,402 @@ class OrderAgent:
             "response": response,
         }
 
+    def process_structured_input(self, telefone: str, message: str, structured_analysis: dict | None) -> dict | None:
+        if not structured_analysis:
+            return None
+
+        intencao = (structured_analysis.get("intencao") or "").strip().lower()
+        confianca = float(structured_analysis.get("confianca") or 0.0)
+        precisa_confirmacao = bool(structured_analysis.get("precisa_confirmacao"))
+
+        if intencao in {"", "desconhecida"} or confianca < 0.55 or precisa_confirmacao:
+            return None
+
+        state = get_or_create_state(telefone)
+        in_order = state.ultima_intencao == "fazer_pedido" or state.status_atendimento != AtendimentoStatus.INICIO
+
+        produto_key = self._structured_product_to_key(
+            produto=structured_analysis.get("produto"),
+            tipo_marmita=structured_analysis.get("tipo_marmita"),
+        )
+        quantidade = structured_analysis.get("quantidade")
+        tipo_entrega = (structured_analysis.get("tipo_entrega") or "").strip().lower()
+        endereco = (structured_analysis.get("endereco") or "").strip()
+
+        if intencao == "alterar_quantidade":
+            if not in_order:
+                return None
+            parsed_qty = self._to_int(str(quantidade)) if quantidade is not None else None
+            if parsed_qty is None:
+                return None
+            if parsed_qty < 1:
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": "Me informe uma quantidade valida (minimo 1).",
+                    "response": "Me informe uma quantidade valida (minimo 1).",
+                }
+            current_key = state.produto or "marmitex_individual"
+            item = self._make_item_from_key(current_key, parsed_qty)
+            if item is None:
+                return self._catalog_unavailable_response(telefone, "item selecionado")
+            return self._apply_order_items(telefone, [item])
+
+        if intencao == "informar_retirada" and in_order:
+            update_state(
+                telefone,
+                tipo_entrega="retirada",
+                endereco="retirada no local",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+                aguardando_resposta="forma_pagamento",
+                ultima_intencao="fazer_pedido",
+            )
+            refreshed = get_or_create_state(telefone)
+            return {
+                "state": asdict(refreshed),
+                "pricing": {
+                    "can_calculate": bool(refreshed.valor_total),
+                    "needs_owner": False,
+                    "unit_price": refreshed.valor_unitario,
+                    "total_price": refreshed.valor_total,
+                },
+                "next_question": "Qual sera a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartao",
+                "response": (
+                    "Perfeito 😊 Vou marcar como retirada no local.\n\n"
+                    "Qual sera a forma de pagamento?\n"
+                    "1 - Pix\n2 - Dinheiro\n3 - Cartao"
+                ),
+            }
+        if intencao == "informar_retirada" and not in_order and "marmita" in self._normalize(message):
+            qty = self._to_int(str(quantidade)) if quantidade is not None else None
+            update_state(
+                telefone,
+                ultima_intencao="fazer_pedido",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_PRODUTO,
+                aguardando_resposta="tipo_marmita",
+                produto="marmita",
+                quantidade=max(1, int(qty or 1)),
+                tipo_entrega="retirada",
+            )
+            refreshed = get_or_create_state(telefone)
+            clarification = "Voce deseja marmitex individual ou marmita para 2, 3, 4 ou 5 pessoas?"
+            return {
+                "state": asdict(refreshed),
+                "pricing": {
+                    "can_calculate": False,
+                    "needs_owner": False,
+                    "unit_price": refreshed.valor_unitario,
+                    "total_price": refreshed.valor_total,
+                },
+                "next_question": clarification,
+                "response": clarification,
+            }
+
+        if intencao in {"informar_endereco", "informar_entrega"} and in_order:
+            if tipo_entrega == "entrega" and not endereco:
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": "Pode me informar o endereco de entrega, por favor?",
+                    "response": "Pode me informar o endereco de entrega, por favor?",
+                }
+            if endereco:
+                update_state(
+                    telefone,
+                    tipo_entrega="entrega",
+                    endereco=endereco,
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+                    aguardando_resposta="forma_pagamento",
+                    ultima_intencao="fazer_pedido",
+                )
+                refreshed = get_or_create_state(telefone)
+                return {
+                    "state": asdict(refreshed),
+                    "pricing": {
+                        "can_calculate": bool(refreshed.valor_total),
+                        "needs_owner": False,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": refreshed.valor_total,
+                    },
+                    "next_question": "Qual sera a forma de pagamento? Pix, dinheiro ou cartao?",
+                    "response": "Perfeito 😊 Endereco anotado. Qual sera a forma de pagamento? Pix, dinheiro ou cartao?",
+                }
+
+        if intencao != "fazer_pedido":
+            return None
+
+        resolved_qty = self._to_int(str(quantidade)) if quantidade is not None else None
+        if resolved_qty is not None and resolved_qty < 1:
+            return {
+                "state": asdict(state),
+                "pricing": {
+                    "can_calculate": bool(state.valor_total),
+                    "needs_owner": False,
+                    "unit_price": state.valor_unitario,
+                    "total_price": state.valor_total,
+                },
+                "next_question": "Me informe uma quantidade valida (minimo 1).",
+                "response": "Me informe uma quantidade valida (minimo 1).",
+            }
+
+        if self._is_ambiguous_marmita_request(
+            produto=structured_analysis.get("produto"),
+            tipo_marmita=structured_analysis.get("tipo_marmita"),
+        ):
+            qty = resolved_qty or state.quantidade or 1
+            update_fields = {
+                "ultima_intencao": "fazer_pedido",
+                "status_atendimento": AtendimentoStatus.AGUARDANDO_PRODUTO,
+                "aguardando_resposta": "tipo_marmita",
+                "produto": "marmita",
+                "quantidade": qty,
+            }
+            if tipo_entrega in {"entrega", "retirada"}:
+                update_fields["tipo_entrega"] = tipo_entrega
+            if endereco:
+                update_fields["endereco"] = endereco
+            update_state(telefone, **update_fields)
+            refreshed = get_or_create_state(telefone)
+            clarification = "Voce deseja marmitex individual ou marmita para 2, 3, 4 ou 5 pessoas?"
+            return {
+                "state": asdict(refreshed),
+                "pricing": {
+                    "can_calculate": False,
+                    "needs_owner": False,
+                    "unit_price": refreshed.valor_unitario,
+                    "total_price": refreshed.valor_total,
+                },
+                "next_question": clarification,
+                "response": clarification,
+            }
+
+        if produto_key is None:
+            return None
+
+        if produto_key.startswith("marmita_") and produto_key.endswith("_pessoas"):
+            people = self._extract_people_from_key(produto_key)
+            if people and people > 5:
+                return None
+
+        qty = resolved_qty or 1
+        if produto_key.startswith("marmita_") and produto_key.endswith("_pessoas"):
+            people_size = self._extract_people_from_key(produto_key)
+            if (
+                people_size
+                and resolved_qty == people_size
+                and self._normalize(structured_analysis.get("produto") or "") == "marmita"
+                and bool(structured_analysis.get("tipo_marmita"))
+            ):
+                qty = 1
+        item = self._make_item_from_key(produto_key, qty)
+        if item is None:
+            human_name = "marmita selecionada" if produto_key != "marmitex_individual" else "marmitex individual"
+            return self._catalog_unavailable_response(telefone, human_name)
+
+        result = self._apply_order_items(telefone, [item])
+        if tipo_entrega == "retirada":
+            update_state(
+                telefone,
+                tipo_entrega="retirada",
+                endereco="retirada no local",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+                aguardando_resposta="forma_pagamento",
+            )
+            refreshed = get_or_create_state(telefone)
+            result["state"] = asdict(refreshed)
+            result["pricing"]["unit_price"] = refreshed.valor_unitario
+            result["pricing"]["total_price"] = refreshed.valor_total
+            result["next_question"] = "Qual sera a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartao"
+            result["response"] = (
+                self._build_items_summary_response(
+                    items=refreshed.itens_pedido,
+                    total=refreshed.valor_total,
+                    ask_address=False,
+                )
+                + "\n\nPerfeito 😊 Vou marcar como retirada no local.\n\n"
+                + "Qual sera a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartao"
+            )
+        elif tipo_entrega == "entrega":
+            if endereco:
+                update_state(
+                    telefone,
+                    tipo_entrega="entrega",
+                    endereco=endereco,
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+                    aguardando_resposta="forma_pagamento",
+                )
+                refreshed = get_or_create_state(telefone)
+                result["state"] = asdict(refreshed)
+                result["pricing"]["unit_price"] = refreshed.valor_unitario
+                result["pricing"]["total_price"] = refreshed.valor_total
+                result["next_question"] = "Qual sera a forma de pagamento? Pix, dinheiro ou cartao?"
+                result["response"] = (
+                    self._build_items_summary_response(
+                        items=refreshed.itens_pedido,
+                        total=refreshed.valor_total,
+                        ask_address=False,
+                    )
+                    + "\n\nPerfeito 😊 Endereco anotado. Qual sera a forma de pagamento? Pix, dinheiro ou cartao?"
+                )
+            else:
+                update_state(
+                    telefone,
+                    tipo_entrega="entrega",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_ENDERECO,
+                    aguardando_resposta="endereco",
+                )
+                refreshed = get_or_create_state(telefone)
+                result["state"] = asdict(refreshed)
+                result["pricing"]["unit_price"] = refreshed.valor_unitario
+                result["pricing"]["total_price"] = refreshed.valor_total
+                result["next_question"] = "Perfeito 😊 Me informe o endereco de entrega, por favor."
+                result["response"] = (
+                    self._build_items_summary_response(
+                        items=refreshed.itens_pedido,
+                        total=refreshed.valor_total,
+                        ask_address=False,
+                    )
+                    + "\n\nPerfeito 😊 Me informe o endereco de entrega, por favor."
+                )
+        return result
+
+    def _make_item_from_key(self, produto_key: str, quantidade: int) -> dict | None:
+        qty = max(1, int(quantidade or 1))
+        if produto_key == "marmitex_individual":
+            return self._make_item("marmitex individual", "marmitex_individual", qty)
+        people = self._extract_people_from_key(produto_key)
+        if not people:
+            return None
+        return self._make_item(f"marmita para {people} pessoas", produto_key, qty)
+
+    def _extract_people_from_key(self, produto_key: str) -> int | None:
+        match = re.match(r"marmita_(\d+)_pessoas$", produto_key or "")
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _structured_product_to_key(self, produto: str | None, tipo_marmita: str | None) -> str | None:
+        p = self._normalize(produto or "")
+        t = self._normalize(tipo_marmita or "")
+        if "marmitex" in p or t == "individual":
+            return "marmitex_individual"
+        if "marmita" in p:
+            if t.endswith("_pessoas"):
+                people = self._to_int(t.replace("_pessoas", ""))
+                if people and 2 <= people <= 5:
+                    return f"marmita_{people}_pessoas"
+            match = re.search(r"(\d+)", t)
+            if match:
+                people = int(match.group(1))
+                if 2 <= people <= 5:
+                    return f"marmita_{people}_pessoas"
+            return None
+        return None
+
+    def _is_ambiguous_marmita_request(self, produto: str | None, tipo_marmita: str | None) -> bool:
+        p = self._normalize(produto or "")
+        t = self._normalize(tipo_marmita or "")
+        if "marmitex" in p:
+            return False
+        if "marmita" not in p:
+            return False
+        return t in {"", "marmita"}
+
+    def _is_waiting_marmita_type(self, state) -> bool:
+        return (
+            state.status_atendimento == AtendimentoStatus.AGUARDANDO_PRODUTO
+            and state.aguardando_resposta == "tipo_marmita"
+            and self._normalize(state.produto or "") == "marmita"
+        )
+
+    def _extract_marmita_type_choice(self, normalized_text: str) -> str | None:
+        if any(term in normalized_text for term in ["marmitex", "individual"]):
+            return "marmitex_individual"
+
+        match = re.search(r"\b([2-5])\b", normalized_text)
+        if match:
+            people = int(match.group(1))
+            return f"marmita_{people}_pessoas"
+        return None
+
+    def _apply_item_with_current_delivery_context(self, telefone: str, items: list[dict]) -> dict:
+        result = self._apply_order_items(telefone, items)
+        refreshed = get_or_create_state(telefone)
+
+        if refreshed.tipo_entrega == "retirada":
+            update_state(
+                telefone,
+                endereco="retirada no local",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+                aguardando_resposta="forma_pagamento",
+            )
+            current = get_or_create_state(telefone)
+            result["state"] = asdict(current)
+            result["pricing"]["unit_price"] = current.valor_unitario
+            result["pricing"]["total_price"] = current.valor_total
+            result["next_question"] = "Qual sera a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartao"
+            result["response"] = (
+                self._build_items_summary_response(
+                    items=current.itens_pedido,
+                    total=current.valor_total,
+                    ask_address=False,
+                )
+                + "\n\nPerfeito 😊 Vou marcar como retirada no local.\n\n"
+                + "Qual sera a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartao"
+            )
+            return result
+
+        if refreshed.tipo_entrega == "entrega" and not refreshed.endereco:
+            update_state(
+                telefone,
+                status_atendimento=AtendimentoStatus.AGUARDANDO_ENDERECO,
+                aguardando_resposta="endereco",
+            )
+            current = get_or_create_state(telefone)
+            result["state"] = asdict(current)
+            result["pricing"]["unit_price"] = current.valor_unitario
+            result["pricing"]["total_price"] = current.valor_total
+            result["next_question"] = "Perfeito 😊 Me informe o endereco de entrega, por favor."
+            result["response"] = (
+                self._build_items_summary_response(
+                    items=current.itens_pedido,
+                    total=current.valor_total,
+                    ask_address=False,
+                )
+                + "\n\nPerfeito 😊 Me informe o endereco de entrega, por favor."
+            )
+        return result
+
     def _wants_to_order(self, text: str) -> bool:
         return any(k in text for k in ["pedido", "pedir", "quero", "comprar", "marmita", "marmitex"])
 
     def _handle_product_menu_choice(self, telefone: str, choice: str) -> dict:
-        if choice == "1":
+        available_choices = get_order_product_choices()
+        selected_choice = next((item for item in available_choices if item["choice"] == choice), None)
+        if selected_choice is None:
+            return {
+                "state": asdict(get_or_create_state(telefone)),
+                "pricing": {
+                    "can_calculate": False,
+                    "needs_owner": False,
+                    "unit_price": 0.0,
+                    "total_price": 0.0,
+                },
+                "next_question": self._product_selection_prompt(),
+                "response": self._product_selection_prompt(),
+            }
+
+        if selected_choice["key"] == "marmitex_individual":
             update_state(
                 telefone,
                 ultima_intencao="fazer_pedido",
@@ -592,23 +1013,28 @@ class OrderAgent:
                 "pricing": {
                     "can_calculate": False,
                     "needs_owner": False,
-                    "unit_price": PRICE_TABLE["marmitex_individual"],
+                    "unit_price": float(selected_choice["preco"]),
                     "total_price": 0.0,
                 },
                 "next_question": "Quantas marmitex individuais voce deseja?",
                 "response": "Perfeito 😊 Quantas marmitex individuais voce deseja?",
             }
 
-        people = int(choice)
+        people = int(selected_choice["people_count"])
         item = self._make_item(
             produto=f"marmita para {people} pessoas",
             produto_key=f"marmita_{people}_pessoas",
             quantidade=1,
         )
+        if item is None:
+            return self._catalog_unavailable_response(telefone, selected_choice["nome"])
         return self._apply_order_items(telefone, [item])
 
-    def _make_item(self, produto: str, produto_key: str, quantidade: int) -> dict:
-        unit = PRICE_TABLE[produto_key]
+    def _make_item(self, produto: str, produto_key: str, quantidade: int) -> dict | None:
+        catalog_item = get_order_product(produto_key, only_available=True)
+        if catalog_item is None:
+            return None
+        unit = float(catalog_item["preco"])
         return {
             "produto": produto,
             "produto_key": produto_key,
@@ -801,15 +1227,10 @@ class OrderAgent:
             if people > 5:
                 needs_owner = True
                 continue
-            price_map = {
-                2: PRICE_TABLE["marmita_2_pessoas"],
-                3: PRICE_TABLE["marmita_3_pessoas"],
-                4: PRICE_TABLE["marmita_4_pessoas"],
-                5: PRICE_TABLE["marmita_5_pessoas"],
-            }
-            if people not in price_map:
+            catalog_item = get_order_product_by_people(people, only_available=True)
+            if catalog_item is None:
                 continue
-            unit = price_map[people]
+            unit = float(catalog_item["preco"])
             items.append(
                 {
                     "produto": f"marmita para {people} pessoas",
@@ -840,7 +1261,10 @@ class OrderAgent:
             if self._overlaps_any_span(m.span(), family_spans + incomplete_family_spans):
                 continue
             qty = self._to_int(m.group("qty") or "1") or 1
-            unit = PRICE_TABLE["marmitex_individual"]
+            catalog_item = get_order_product("marmitex_individual", only_available=True)
+            if catalog_item is None:
+                continue
+            unit = float(catalog_item["preco"])
             items.append(
                 {
                     "produto": "marmitex individual",
@@ -948,28 +1372,35 @@ class OrderAgent:
         has_specific = False
 
         if "marmitex" in normalized_text:
-            lines.append("A marmitex individual custa R$ 21,00.")
+            product = get_order_product("marmitex_individual", only_available=True)
+            if product is not None:
+                lines.append(f"A marmitex individual custa {format_brl(product['preco'])}.")
+            else:
+                lines.append("No momento a marmitex individual nao esta disponivel.")
             has_specific = True
 
-        for people, value in [(2, "R$ 65,00"), (3, "R$ 85,00"), (4, "R$ 105,00"), (5, "R$ 125,00")]:
+        for people in [2, 3, 4, 5]:
             words = {str(people), self._number_word(people)}
             if any(
                 (f"marmita para {w} pessoas" in normalized_text) or (f"marmita para {w} pessoa" in normalized_text)
                 for w in words
             ):
-                lines.append(f"A marmita para {people} pessoas custa {value}.")
+                product = get_order_product_by_people(people, only_available=True)
+                if product is not None:
+                    lines.append(f"A marmita para {people} pessoas custa {format_brl(product['preco'])}.")
+                else:
+                    lines.append(f"No momento a marmita para {people} pessoas nao esta disponivel.")
                 has_specific = True
 
         if not has_specific:
-            lines = [
-                "Nossos valores sao:\n",
-                "* Marmitex individual: R$ 21,00",
-                "* Marmita para 2 pessoas: R$ 65,00",
-                "* Marmita para 3 pessoas: R$ 85,00",
-                "* Marmita para 4 pessoas: R$ 105,00",
-                "* Marmita para 5 pessoas: R$ 125,00",
-                "\nPara pedidos acima de 5 pessoas, preciso consultar a proprietaria.",
-            ]
+            available_products = list_order_products(only_available=True)
+            if available_products:
+                lines = ["Nossos valores sao:\n"]
+                for product in available_products:
+                    lines.append(f"* {product['nome']}: {format_brl(product['preco'])}")
+                lines.append("\nPara pedidos acima de 5 pessoas, preciso consultar a proprietaria.")
+            else:
+                lines = ["No momento nao ha opcoes de pedido disponiveis no catalogo."]
 
         if in_order:
             lines.append("\nQuer continuar seu pedido? 😊")
@@ -1010,6 +1441,38 @@ class OrderAgent:
     def _looks_like_address(self, text: str) -> bool:
         return any(k in text for k in ["rua", "av", "avenida", "travessa", "bairro", "numero", "nº", "cep"])
 
+    def _product_selection_prompt(self) -> str:
+        choices = get_order_product_choices()
+        if not choices:
+            return (
+                "No momento nao ha produtos de pedido disponiveis no catalogo. "
+                "Pode falar com a atendente para ajustar a disponibilidade."
+            )
+
+        lines = ["Voce deseja:"]
+        for item in choices:
+            lines.append(f"{item['choice']} - {item['nome']}")
+        lines.append("")
+        lines.append('Ou, se preferir, me diga direto a quantidade. Exemplo: "quero 3 marmitex".')
+        return "\n".join(lines)
+
+    def _catalog_unavailable_response(self, telefone: str, product_name: str) -> dict:
+        response = (
+            f"No momento {product_name.lower()} nao esta disponivel. "
+            "Se quiser, posso te mostrar as opcoes que estao disponiveis agora."
+        )
+        return {
+            "state": asdict(get_or_create_state(telefone)),
+            "pricing": {
+                "can_calculate": False,
+                "needs_owner": False,
+                "unit_price": 0.0,
+                "total_price": 0.0,
+            },
+            "next_question": self._product_selection_prompt(),
+            "response": f"{response}\n\n{self._product_selection_prompt()}",
+        }
+
     def _calculate_price(self, produto: str, quantidade: int) -> dict:
         if not produto:
             return {"can_calculate": False, "needs_owner": False, "unit_price": 0.0, "total_price": 0.0}
@@ -1019,7 +1482,10 @@ class OrderAgent:
 
         if produto == "marmitex_individual":
             qty = max(1, int(quantidade or 1))
-            unit = PRICE_TABLE["marmitex_individual"]
+            catalog_item = get_order_product(produto, only_available=True)
+            if catalog_item is None:
+                return {"can_calculate": False, "needs_owner": False, "unit_price": 0.0, "total_price": 0.0}
+            unit = float(catalog_item["preco"])
             return {
                 "can_calculate": True,
                 "needs_owner": False,
@@ -1027,8 +1493,9 @@ class OrderAgent:
                 "total_price": round(unit * qty, 2),
             }
 
-        if produto in PRICE_TABLE:
-            value = PRICE_TABLE[produto]
+        catalog_item = get_order_product(produto, only_available=True)
+        if catalog_item is not None:
+            value = float(catalog_item["preco"])
             return {
                 "can_calculate": True,
                 "needs_owner": False,
@@ -1075,7 +1542,7 @@ class OrderAgent:
         waiting = self._awaiting_field(state, pricing)
         if waiting == "produto":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_PRODUTO)
-            return "Qual produto voce deseja? Marmitex individual ou marmita para quantas pessoas?"
+            return self._product_selection_prompt()
         if waiting == "quantidade":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_QUANTIDADE)
             return "Qual a quantidade desejada?"

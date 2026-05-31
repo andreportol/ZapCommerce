@@ -9,6 +9,7 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+# ajuste o DATABASE_URL para um PostgreSQL valido antes de continuar
 python manage.py migrate
 python manage.py createsuperuser
 python manage.py criar_dados_iniciais
@@ -31,6 +32,11 @@ python manage.py runserver
 - `.env.example`: base para desenvolvimento local.
 - `.env.test.example`: exemplo para ambiente de testes.
 - `.env.production.example`: exemplo para producao.
+
+## Banco de dados
+
+- `DATABASE_URL` e obrigatoria.
+- O projeto aceita apenas PostgreSQL como banco principal.
 
 ## Publicacao no GitHub
 

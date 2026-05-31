@@ -1,6 +1,7 @@
 from pathlib import Path
 from decouple import Csv, config
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -51,17 +52,16 @@ WSGI_APPLICATION = 'marmitaria_ia.wsgi.application'
 ASGI_APPLICATION = 'marmitaria_ia.asgi.application'
 
 database_url = config('DATABASE_URL', default='').strip()
-if database_url:
-    DATABASES = {
-        'default': dj_database_url.parse(database_url, conn_max_age=600),
-    }
-else:
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
-        }
-    }
+if not database_url:
+    raise ImproperlyConfigured('DATABASE_URL obrigatoria. Configure uma URL PostgreSQL para a aplicacao.')
+
+database_config = dj_database_url.parse(database_url, conn_max_age=600)
+if database_config.get('ENGINE') != 'django.db.backends.postgresql':
+    raise ImproperlyConfigured('DATABASE_URL deve apontar para PostgreSQL.')
+
+DATABASES = {
+    'default': database_config,
+}
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},

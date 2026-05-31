@@ -5,7 +5,6 @@ import requests
 from django.conf import settings
 from django.db import transaction
 
-from .agents.marmitaria_agent import responder_com_agente
 from .agents.orchestrator_agent import OrchestratorAgent
 from .models import Cliente, ConfiguracaoMarmitaria, Conversa, Mensagem
 
@@ -95,7 +94,10 @@ def gerar_resposta_atendimento(
             return resposta
     except Exception as exc:
         logger.exception('Falha ao gerar resposta com OrchestratorAgent: %s', exc)
-    return ''
+    return (
+        'Nao consegui continuar seu atendimento agora com seguranca. '
+        'Pode reformular a mensagem ou pedir para falar com a atendente?'
+    )
 
 
 def deve_encaminhar_para_humano(texto: str, resposta: str) -> bool:
@@ -110,7 +112,6 @@ def deve_encaminhar_para_humano(texto: str, resposta: str) -> bool:
             'humano',
             'pessoa',
             'falar com alguem',
-            'falar com alguém',
         ]
     ):
         return True
@@ -180,8 +181,6 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
                 file_name=file_name,
                 file_mimetype=file_mimetype,
             )
-            if not resposta:
-                resposta = responder_com_agente(cliente=cliente, conversa=conversa, texto=texto)
             if not resposta:
                 return
 
