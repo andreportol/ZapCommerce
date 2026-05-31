@@ -38,6 +38,8 @@ class Command(BaseCommand):
         orchestrator.cardapio_agent.get_cardapio = lambda: (
             "## segunda-feira\n"
             "- Feijoada\n- Arroz\n- Farofa\n"
+            "## terca-feira\n"
+            "- Frango grelhado\n- Arroz\n- Feijao\n"
         )
         # Simula domingo 31/05/2026 para teste deterministico.
         orchestrator_module.timezone.localdate = lambda: date(2026, 5, 31)
@@ -46,26 +48,60 @@ class Command(BaseCommand):
             {
                 "name": "A",
                 "phone": "SIM_CONFLITO_1",
-                "messages": ["oi", "2", "hoje é segunda-feira"],
-                "expect": "pelo sistema, hoje e domingo, 31/05/2026",
+                "messages": ["oi", "2"],
+                "expect": "confira os cardapios disponiveis da semana",
             },
             {
                 "name": "B",
                 "phone": "SIM_CONFLITO_2",
-                "messages": ["eu já consigo reservar hoje o cardápio de segunda-feira?"],
-                "expect": "hoje nao consigo registrar a encomenda",
+                "messages": ["sim, quero o cardápio de terça-feira", "gostei do cardápio. pode reservar que na segunda às 11 eu retiro"],
+                "expect": "percebi uma diferenca",
+                "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:terca-feira"},
             },
             {
                 "name": "C",
                 "phone": "SIM_CONFLITO_3",
-                "messages": ["oi", "2", "sim, de segunda"],
-                "expect": "o cardapio de segunda-feira",
+                "messages": ["sim, quero o cardápio de segunda-feira", "gostei do cardápio. pode reservar que na segunda às 11 eu retiro"],
+                "expect": "que bom que gostou",
+                "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:segunda-feira"},
             },
             {
                 "name": "D",
                 "phone": "SIM_CONFLITO_4",
-                "messages": ["preste atenção, hoje é segunda-feira, faça meu pedido"],
-                "expect": "pelo sistema, hoje e domingo, 31/05/2026",
+                "messages": ["sim, quero o cardápio de terça-feira", "gostei do cardápio. pode reservar que eu retiro às 11"],
+                "expect": "para reservar o cardapio de terca-feira",
+                "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:terca-feira"},
+            },
+            {
+                "name": "F",
+                "phone": "SIM_CONFLITO_6",
+                "messages": ["vcs entregam no meu serviço?"],
+                "expect": "fazemos entrega, sim",
+            },
+            {
+                "name": "G",
+                "phone": "SIM_CONFLITO_7",
+                "messages": ["quero saber se fazem entrega da marmitex?"],
+                "expect": "sim, fazemos entrega de marmitex",
+                "expect_not": "fora do horario de pedidos",
+            },
+            {
+                "name": "H",
+                "phone": "SIM_CONFLITO_8",
+                "messages": ["qual horário de entrega?"],
+                "expect": "as entregas acontecem das 11h as 13h",
+            },
+            {
+                "name": "I",
+                "phone": "SIM_CONFLITO_9",
+                "messages": ["posso retirar no local?"],
+                "expect": "sim, voce tambem pode retirar no local",
+            },
+            {
+                "name": "J",
+                "phone": "SIM_CONFLITO_10",
+                "messages": ["quero 2 marmitex para entregar"],
+                "expect": "fora do horario de pedidos",
             },
         ]
 
@@ -75,11 +111,21 @@ class Command(BaseCommand):
             phone = scenario["phone"]
             store.pop(phone, None)
             last_response = ""
-            for message in scenario["messages"]:
+            state_markers_by_step: dict[int, str] = {}
+            for idx, message in enumerate(scenario["messages"], start=1):
                 result = orchestrator.handle_message(message=message, telefone=phone)
                 last_response = (result.get("final_response") or "")
+                current_state = store.get(phone)
+                state_markers_by_step[idx] = (current_state.ultima_intencao if current_state else "") or ""
             normalized_response = self._normalize(last_response)
             ok = self._normalize(scenario["expect"]) in normalized_response
+            if scenario.get("expect_not"):
+                ok = ok and self._normalize(scenario["expect_not"]) not in normalized_response
+            marker_cfg = scenario.get("expect_state_marker_after_step")
+            if marker_cfg:
+                step = int(marker_cfg["step"])
+                expected_marker = marker_cfg["value"]
+                ok = ok and state_markers_by_step.get(step, "") == expected_marker
             self.stdout.write(
                 f"{scenario['name']} | {normalized_response} | {'OK' if ok else 'ERRO'}"
             )

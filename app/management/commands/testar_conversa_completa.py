@@ -227,7 +227,7 @@ class Command(BaseCommand):
         r2 = transcript[1]["response"].lower()
         checks = [
             s1["produto"] == "marmita" and s1["status_atendimento"] == AtendimentoStatus.AGUARDANDO_PRODUTO,
-            s2["produto"] == "marmita" and s2["quantidade"] == 2 and "nao consegui identificar o tipo" in r2,
+            s2["produto"] == "marmita" and s2["quantidade"] == 2 and ("não consegui identificar o tipo" in r2 or "nao consegui identificar o tipo" in r2),
             s3["produto"] == "marmita_3_pessoas" and s3["quantidade"] == 2 and s3["status_atendimento"] == AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA,
         ]
         return (all(checks), "fluxo esperado para duvida de tipo" if all(checks) else "falha no tratamento de nao sei")

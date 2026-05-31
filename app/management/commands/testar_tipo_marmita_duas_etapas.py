@@ -120,7 +120,7 @@ class Command(BaseCommand):
                 and state.quantidade == 2
                 and state.tipo_entrega == "entrega"
                 and state.status_atendimento == AtendimentoStatus.AGUARDANDO_ENDERECO
-                and "endereco" in resp
+                and ("endereco" in resp or "endereço" in resp)
             )
         if label == "B":
             return (
@@ -149,6 +149,6 @@ class Command(BaseCommand):
                 state.produto == "marmita"
                 and state.quantidade == 2
                 and state.status_atendimento == AtendimentoStatus.AGUARDANDO_PRODUTO
-                and "nao consegui identificar o tipo" in resp
+                and ("não consegui identificar o tipo" in resp or "nao consegui identificar o tipo" in resp)
             )
         return False
