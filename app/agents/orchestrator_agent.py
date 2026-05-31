@@ -55,16 +55,41 @@ class OrchestratorAgent:
     ) -> dict:
         phone_key = (telefone or "sessao_padrao").strip()
         conversation_state = get_or_create_state(phone_key)
-        if conversation_state.status_atendimento == AtendimentoStatus.FORA_HORARIO and self._is_acknowledgement(message):
+        if (
+            conversation_state.status_atendimento in {
+                AtendimentoStatus.FORA_HORARIO,
+                AtendimentoStatus.CONSULTANDO_CARDAPIO,
+            }
+            and self._is_acknowledgement(message)
+        ):
             reset_state(phone_key)
             return {
                 "intent": "encerramento",
-                "database": {"implemented": False, "message": "Cliente reconheceu aviso fora do horario.", "data": None},
+                "database": {"implemented": False, "message": "Cliente encerrou o atendimento atual.", "data": None},
                 "instructions": self.instructions_agent.get_instructions(),
                 "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
                 "rag_results": [],
                 "file_info": None,
-                "final_response": "Certo 😊 Quando estiver dentro do horario de pedidos, e so me chamar.",
+                "final_response": "Certo 😊 Se precisar de algo mais, e so me chamar.",
+            }
+
+        if (
+            conversation_state.status_atendimento == AtendimentoStatus.FORA_HORARIO
+            and self._is_cardapio_confirmation_after_offer(message)
+        ):
+            update_state(
+                phone_key,
+                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+                aguardando_resposta="cardapio",
+            )
+            return {
+                "intent": "consultando_cardapio",
+                "database": {"implemented": False, "message": "Cliente aceitou ver cardapio fora do horario.", "data": None},
+                "instructions": self.instructions_agent.get_instructions(),
+                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+                "rag_results": [],
+                "file_info": None,
+                "final_response": self._cardapio_after_hours_response(),
             }
 
         if self._is_cancel_request(message):
@@ -147,6 +172,52 @@ class OrchestratorAgent:
         rag_result = self.rag_agent.search(message, top_k=4)
         rag_snippets = rag_result.get("results", [])
         file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if (file_name or file_mimetype) else None
+
+        if self._is_price_question_context(message) or self._is_price_followup_context(message, conversation_state):
+            final_response = self._build_price_response(message)
+            if not self._is_open_for_orders():
+                final_response = self._adjust_price_response_outside_business_hours(final_response)
+                update_state(
+                    phone_key,
+                    status_atendimento=AtendimentoStatus.FORA_HORARIO,
+                    ultima_intencao="consultar_valores",
+                    aguardando_resposta="fora_horario",
+                )
+            else:
+                update_state(phone_key, ultima_intencao="consultar_valores")
+            return {
+                "intent": "consultar_valores",
+                "database": {"implemented": False, "message": "Consulta local de valores.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": final_response,
+            }
+
+        if (
+            conversation_state.status_atendimento in {
+                AtendimentoStatus.INICIO,
+                AtendimentoStatus.FORA_HORARIO,
+                AtendimentoStatus.CONSULTANDO_CARDAPIO,
+            }
+            and (analysis.menu_option == "2" or self._is_cardapio_followup(message))
+        ):
+            update_state(
+                phone_key,
+                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+                aguardando_resposta="cardapio",
+            )
+            cardapio_message = "hoje" if analysis.menu_option == "2" else message
+            return {
+                "intent": "consultando_cardapio",
+                "database": {"implemented": False, "message": "Consulta local de cardapio.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "final_response": self._build_cardapio_response(cardapio_message, cardapio),
+            }
 
         if (
             conversation_state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO
@@ -462,7 +533,15 @@ class OrchestratorAgent:
         if self._is_open_for_orders():
             return False
         text = self._normalize_short_text(message)
+        if self._is_price_followup_context(message, state):
+            return False
+        if self._is_price_question_context(message):
+            return False
         order_attempt = self._is_business_hours_order_attempt(text)
+        if order_attempt:
+            return True
+        if text == "2" or self._is_cardapio_followup(message):
+            return False
         if self._is_menu_request_during_order(message, state):
             return False
         if state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO and not order_attempt:
@@ -508,6 +587,13 @@ class OrchestratorAgent:
                 "Entregas e retiradas: das 11h às 13h.\n\n"
                 "Se quiser, posso te mostrar o cardápio. Para isso, digite 2."
             )
+        if self._extract_weekday(message):
+            return (
+                "Mesmo para outro dia, os pedidos/encomendas precisam ser feitos dentro do horário de atendimento.\n\n"
+                "Pedidos/encomendas: segunda a sábado, das 9h às 12h30.\n"
+                "Entregas e retiradas: das 11h às 13h.\n"
+                "Por favor, chame dentro do horário de pedidos para fazer sua encomenda."
+            )
         return (
             "No momento estamos fora do horário de pedidos.\n\n"
             "Pedidos/encomendas: segunda a sábado, das 9h às 12h30.\n"
@@ -531,6 +617,55 @@ class OrchestratorAgent:
             "Pedidos/encomendas podem ser feitos de segunda a sábado, das 9h às 12h30."
         )
 
+    def _build_price_response(self, message: str) -> str:
+        text = self._normalize_short_text(message)
+        lines: list[str] = []
+
+        if "marmitex" in text:
+            lines.append("A marmitex individual custa R$ 21,00.")
+
+        people_prices = {
+            2: "R$ 65,00",
+            3: "R$ 85,00",
+            4: "R$ 105,00",
+            5: "R$ 125,00",
+        }
+        for people, price in people_prices.items():
+            aliases = {str(people), self._number_word(people)}
+            if any(
+                f"marmita para {alias} pessoas" in text
+                or f"marmita para {alias} pessoa" in text
+                for alias in aliases
+            ):
+                lines.append(f"A marmita para {people} pessoas custa {price}.")
+
+        if lines:
+            return "\n".join(lines)
+
+        return (
+            "Nossos valores sao:\n\n"
+            "* Marmitex individual: R$ 21,00\n"
+            "* Marmita para 2 pessoas: R$ 65,00\n"
+            "* Marmita para 3 pessoas: R$ 85,00\n"
+            "* Marmita para 4 pessoas: R$ 105,00\n"
+            "* Marmita para 5 pessoas: R$ 125,00\n\n"
+            "Para pedidos acima de 5 pessoas, preciso consultar a proprietaria."
+        )
+
+    def _is_price_followup_context(self, message: str, state) -> bool:
+        if state.ultima_intencao != "consultar_valores":
+            return False
+        text = self._normalize_short_text(message)
+        return "marmitex" in text or "marmita" in text
+
+    def _number_word(self, number: int) -> str:
+        return {
+            2: "duas",
+            3: "tres",
+            4: "quatro",
+            5: "cinco",
+        }.get(number, str(number))
+
     def _is_acknowledgement(self, message: str) -> bool:
         text = self._normalize_short_text(message)
         return text in {
@@ -548,6 +683,20 @@ class OrchestratorAgent:
             "valeu",
             "combinado",
             "entendi",
+        }
+
+    def _is_cardapio_confirmation_after_offer(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return text in {
+            "sim",
+            "quero",
+            "eu quero",
+            "gostaria",
+            "quero sim",
+            "pode ser",
+            "me mostra",
+            "mostrar",
+            "pode mostrar",
         }
 
     def _is_greeting(self, message: str) -> bool:
