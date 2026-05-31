@@ -205,7 +205,7 @@ class Command(BaseCommand):
             s1["produto"] == "marmita_4_pessoas" and s1["quantidade"] == 1,
             s3["tipo_entrega"] == "entrega",
             "cear" in s3["endereco"].lower(),
-            s4["forma_pagamento"].lower() == "cartao",
+            s4["forma_pagamento"].lower() in {"cartao", "cartão"},
         ]
         return (all(checks), "fluxo esperado para marmita 4 pessoas" if all(checks) else "falha em uma etapa do cenario 3")
 

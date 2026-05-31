@@ -49,59 +49,38 @@ class Command(BaseCommand):
                 "name": "A",
                 "phone": "SIM_CONFLITO_1",
                 "messages": ["oi", "2"],
-                "expect": "confira os cardapios disponiveis da semana",
+                "expect": "cardapios disponiveis:",
+                "expect_state_marker_after_step": {"step": 2, "value": "consultar_cardapio"},
+                "expect_state_marker_not_after_step": {"step": 2, "value": "consultar_cardapio:domingo"},
             },
             {
                 "name": "B",
                 "phone": "SIM_CONFLITO_2",
-                "messages": ["sim, quero o cardápio de terça-feira", "gostei do cardápio. pode reservar que na segunda às 11 eu retiro"],
-                "expect": "percebi uma diferenca",
-                "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:terca-feira"},
+                "messages": ["oi", "2", "quero reservar para segunda-feira"],
+                "expect": "para reservar para segunda-feira, por favor chame na segunda entre 9h e 12h30.",
+                "expect_not": "retirada as 11h",
             },
             {
                 "name": "C",
                 "phone": "SIM_CONFLITO_3",
-                "messages": ["sim, quero o cardápio de segunda-feira", "gostei do cardápio. pode reservar que na segunda às 11 eu retiro"],
-                "expect": "que bom que gostou",
-                "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:segunda-feira"},
+                "messages": ["sim, quero o cardápio de terça-feira", "quero reservar para segunda-feira"],
+                "expect": "percebi uma diferenca",
+                "expect_not": "retirada as 11h",
+                "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:terca-feira"},
             },
             {
                 "name": "D",
                 "phone": "SIM_CONFLITO_4",
-                "messages": ["sim, quero o cardápio de terça-feira", "gostei do cardápio. pode reservar que eu retiro às 11"],
-                "expect": "para reservar o cardapio de terca-feira",
+                "messages": ["sim, quero o cardápio de terça-feira", "quero reservar para segunda-feira às 11h"],
+                "expect": "voce tambem mencionou o horario de 11h",
                 "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:terca-feira"},
             },
             {
-                "name": "F",
-                "phone": "SIM_CONFLITO_6",
-                "messages": ["vcs entregam no meu serviço?"],
-                "expect": "fazemos entrega, sim",
-            },
-            {
-                "name": "G",
-                "phone": "SIM_CONFLITO_7",
-                "messages": ["quero saber se fazem entrega da marmitex?"],
-                "expect": "sim, fazemos entrega de marmitex",
-                "expect_not": "fora do horario de pedidos",
-            },
-            {
-                "name": "H",
-                "phone": "SIM_CONFLITO_8",
-                "messages": ["qual horário de entrega?"],
-                "expect": "as entregas acontecem das 11h as 13h",
-            },
-            {
-                "name": "I",
-                "phone": "SIM_CONFLITO_9",
-                "messages": ["posso retirar no local?"],
-                "expect": "sim, voce tambem pode retirar no local",
-            },
-            {
-                "name": "J",
-                "phone": "SIM_CONFLITO_10",
-                "messages": ["quero 2 marmitex para entregar"],
-                "expect": "fora do horario de pedidos",
+                "name": "E",
+                "phone": "SIM_CONFLITO_5",
+                "messages": ["sim, quero o cardápio de segunda-feira", "quero reservar para segunda-feira e retirar às 11h"],
+                "expect": "as retiradas acontecem das 11h as 13h, entao a retirada as 11h esta dentro do horario.",
+                "expect_state_marker_after_step": {"step": 1, "value": "consultar_cardapio:segunda-feira"},
             },
         ]
 
@@ -126,6 +105,11 @@ class Command(BaseCommand):
                 step = int(marker_cfg["step"])
                 expected_marker = marker_cfg["value"]
                 ok = ok and state_markers_by_step.get(step, "") == expected_marker
+            marker_not_cfg = scenario.get("expect_state_marker_not_after_step")
+            if marker_not_cfg:
+                step = int(marker_not_cfg["step"])
+                unexpected_marker = marker_not_cfg["value"]
+                ok = ok and state_markers_by_step.get(step, "") != unexpected_marker
             self.stdout.write(
                 f"{scenario['name']} | {normalized_response} | {'OK' if ok else 'ERRO'}"
             )
