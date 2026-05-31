@@ -20,6 +20,7 @@ class ConversationState:
 
 class AtendimentoStatus:
     INICIO = "inicio"
+    FORA_HORARIO = "fora_horario"
     CONSULTANDO_CARDAPIO = "consultando_cardapio"
     AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO = "aguardando_confirmacao_fazer_pedido"
     FAZENDO_PEDIDO = "fazendo_pedido"

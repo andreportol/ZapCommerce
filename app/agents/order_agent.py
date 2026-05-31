@@ -146,6 +146,36 @@ class OrderAgent:
                     "next_question": "",
                     "response": "Pedido cancelado. Se precisar de algo mais, e so me chamar.",
                 }
+
+            changed_items = self._extract_order_items(text)
+            if changed_items["items"] and self._is_explicit_order_request(normalized):
+                return self._apply_order_items(telefone, changed_items["items"])
+
+            if changed_items["incomplete_family"] and self._is_explicit_order_request(normalized):
+                update_state(
+                    telefone,
+                    ultima_intencao="fazer_pedido",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA,
+                    itens_pendentes=changed_items["items"],
+                    quantidade=changed_items["incomplete_family_quantity"],
+                    aguardando_resposta="pessoas_marmita",
+                )
+                refreshed = get_or_create_state(telefone)
+                partial = self._build_partial_items_text(refreshed.itens_pendentes)
+                return {
+                    "state": asdict(refreshed),
+                    "pricing": {
+                        "can_calculate": bool(refreshed.itens_pendentes),
+                        "needs_owner": False,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": round(sum(item["subtotal"] for item in refreshed.itens_pendentes), 2),
+                    },
+                    "next_question": "Essa marmita e para quantas pessoas? Temos opcoes para 2, 3, 4 ou 5 pessoas.",
+                    "response": (
+                        f"{partial}\n\n" if partial else ""
+                    ) + "Essa marmita e para quantas pessoas? Temos opcoes para 2, 3, 4 ou 5 pessoas.",
+                }
+
             if self._is_delivery_fee_question(normalized):
                 return {
                     "state": asdict(state),

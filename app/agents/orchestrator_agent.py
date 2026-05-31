@@ -55,6 +55,17 @@ class OrchestratorAgent:
     ) -> dict:
         phone_key = (telefone or "sessao_padrao").strip()
         conversation_state = get_or_create_state(phone_key)
+        if conversation_state.status_atendimento == AtendimentoStatus.FORA_HORARIO and self._is_acknowledgement(message):
+            reset_state(phone_key)
+            return {
+                "intent": "encerramento",
+                "database": {"implemented": False, "message": "Cliente reconheceu aviso fora do horario.", "data": None},
+                "instructions": self.instructions_agent.get_instructions(),
+                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+                "rag_results": [],
+                "file_info": None,
+                "final_response": "Certo 😊 Quando estiver dentro do horario de pedidos, e so me chamar.",
+            }
 
         if self._is_cancel_request(message):
             has_order_context = bool(conversation_state.itens_pedido or conversation_state.produto or conversation_state.valor_total)
@@ -76,6 +87,11 @@ class OrchestratorAgent:
         if self._should_block_by_business_hours(message, conversation_state):
             if conversation_state.status_atendimento != AtendimentoStatus.INICIO:
                 reset_state(phone_key)
+            update_state(
+                phone_key,
+                status_atendimento=AtendimentoStatus.FORA_HORARIO,
+                aguardando_resposta="fora_horario",
+            )
             return {
                 "intent": "fora_horario",
                 "database": {"implemented": False, "message": "Atendimento fora do horario de pedidos.", "data": None},
@@ -173,7 +189,7 @@ class OrchestratorAgent:
                 "cardapio_loaded": bool(cardapio),
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
-                "final_response": self._build_cardapio_response("hoje", cardapio),
+                "final_response": self._build_cardapio_response("hoje", cardapio, respect_business_hours=True),
             }
 
         if (
@@ -231,6 +247,9 @@ class OrchestratorAgent:
                 file_name=file_name,
                 file_mimetype=file_mimetype,
             )
+            final_response = order_data.get("response", "")
+            if not self._is_open_for_orders() and self._is_price_question_context(message):
+                final_response = self._adjust_price_response_outside_business_hours(final_response)
             return {
                 "intent": "fazer_pedido",
                 "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
@@ -239,7 +258,7 @@ class OrchestratorAgent:
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
                 "order_state": order_data.get("state"),
-                "final_response": order_data.get("response", ""),
+                "final_response": final_response,
             }
 
         menu_response = self._handle_menu_option(analysis.menu_option)
@@ -455,6 +474,11 @@ class OrchestratorAgent:
     def _is_business_hours_order_attempt(self, normalized_text: str) -> bool:
         if normalized_text == "1":
             return True
+        has_product = "marmitex" in normalized_text or "marmita" in normalized_text
+        is_price_question = any(term in normalized_text for term in ["valor", "valores", "preco", "precos", "quanto custa", "custa"])
+        is_menu_question = "cardapio" in normalized_text or "menu" in normalized_text
+        if has_product and not is_price_question and not is_menu_question:
+            return True
         terms = [
             "pedido",
             "pedir",
@@ -490,6 +514,41 @@ class OrchestratorAgent:
             "Entregas e retiradas: das 11h às 13h.\n"
             "Por favor, chame dentro desse horário para fazer sua encomenda."
         )
+
+    def _adjust_price_response_outside_business_hours(self, response: str) -> str:
+        text = (response or "").strip()
+        if not text:
+            return text
+        remove_lines = [
+            "Se quiser, posso continuar seu pedido 😊",
+            "Quer continuar seu pedido? 😊",
+        ]
+        for line in remove_lines:
+            text = text.replace(f"\n\n{line}", "").replace(line, "")
+        text = text.strip()
+        return (
+            f"{text}\n\n"
+            "Pedidos/encomendas podem ser feitos de segunda a sábado, das 9h às 12h30."
+        )
+
+    def _is_acknowledgement(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return text in {
+            "ok",
+            "okay",
+            "certo",
+            "ta bom",
+            "tá bom",
+            "esta bom",
+            "está bom",
+            "beleza",
+            "blz",
+            "obrigado",
+            "obrigada",
+            "valeu",
+            "combinado",
+            "entendi",
+        }
 
     def _is_greeting(self, message: str) -> bool:
         text = self._normalize_short_text(message)
@@ -530,6 +589,7 @@ class OrchestratorAgent:
         text = self._normalize_short_text(message)
         return (
             self._is_today_request(text)
+            or self._is_weekly_cardapio_request(text)
             or bool(self._extract_weekday(text))
             or "cardapio" in text
             or "menu" in text
@@ -539,9 +599,15 @@ class OrchestratorAgent:
     def _is_today_request(self, normalized_text: str) -> bool:
         return normalized_text in {"hoje", "o de hoje", "de hoje", "cardapio de hoje", "menu de hoje"} or "hoje" in normalized_text
 
-    def _build_cardapio_response(self, message: str, cardapio: str) -> str:
+    def _build_cardapio_response(self, message: str, cardapio: str, respect_business_hours: bool = True) -> str:
         normalized = self._normalize_short_text(message)
+        if self._is_weekly_cardapio_request(normalized):
+            return self._build_weekly_cardapio_response(cardapio)
+
         day = self._extract_weekday(message or "")
+        if respect_business_hours and not self._is_open_for_orders() and (not day or self._is_today_request(normalized)):
+            return self._cardapio_after_hours_response()
+
         if not day or self._is_today_request(normalized):
             day = self._current_weekday_ptbr()
             prefix = f"Claro 😊 Hoje é {self._display_weekday(day)}. O cardápio de hoje é:"
@@ -552,6 +618,55 @@ class OrchestratorAgent:
         if not day_menu:
             return "Nao encontrei cardápio cadastrado para esse dia. Pode me dizer outro dia da semana?"
         return f"{prefix}\n\n{day_menu}"
+
+    def _cardapio_after_hours_response(self) -> str:
+        return (
+            "O cardápio de hoje já encerrou junto com o horário de pedidos.\n\n"
+            "Pedidos/encomendas podem ser feitos de segunda a sábado, das 9h às 12h30.\n"
+            "Entregas e retiradas acontecem das 11h às 13h.\n\n"
+            "Se quiser, posso te mostrar o cardápio da semana ou de um dia específico. "
+            "Exemplo: cardápio de terça-feira."
+        )
+
+    def _is_weekly_cardapio_request(self, normalized_text: str) -> bool:
+        compact = normalized_text.replace(" ", "")
+        weekly_terms = [
+            "cardapio semanal",
+            "cardapio samanal",
+            "cardapio da semana",
+            "cardapio de semana",
+            "cardapio de toda a semana",
+            "cardapio toda semana",
+            "cardapio semana toda",
+            "cardapio da semana toda",
+            "menu semanal",
+            "menu da semana",
+            "toda a semana",
+            "semana toda",
+            "todos os dias",
+        ]
+        compact_terms = [
+            "cardapiosemanal",
+            "cardapiosamanal",
+            "cardapiodatodasemana",
+            "cardapiodetodaasemana",
+            "cardapiodasemana",
+        ]
+        return any(term in normalized_text for term in weekly_terms) or any(term in compact for term in compact_terms)
+
+    def _build_weekly_cardapio_response(self, cardapio: str) -> str:
+        days = ["segunda-feira", "terca-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sabado"]
+        sections = []
+        for day in days:
+            day_menu = self._extract_day_menu(cardapio, day)
+            if not day_menu:
+                continue
+            sections.append(f"*{self._display_weekday(day).capitalize()}*\n{day_menu}")
+
+        if not sections:
+            return "Nao encontrei o cardápio semanal cadastrado."
+
+        return "Claro 😊 Esse é o cardápio da semana:\n\n" + "\n\n".join(sections)
 
     def _display_weekday(self, day: str) -> str:
         labels = {
@@ -566,6 +681,10 @@ class OrchestratorAgent:
         return labels.get(day, day)
 
     def _build_cardapio_response_for_order(self, message: str, cardapio: str, state) -> str:
+        normalized = self._normalize_short_text(message)
+        if self._is_weekly_cardapio_request(normalized):
+            return f"{self._build_weekly_cardapio_response(cardapio)}\n\n{self._order_continuation_prompt(state)}"
+
         day = self._extract_weekday(message or "")
         if not day:
             day = self._current_weekday_ptbr()
@@ -711,8 +830,12 @@ class OrchestratorAgent:
                 if value:
                     return f"A marmita para {people_count} pessoas custa {value}."
 
-        if "cardapio" in msg or "cardápio" in msg:
-            day = self._extract_weekday(msg)
+        normalized_msg = self._normalize_short_text(message)
+        if "cardapio" in normalized_msg:
+            if self._is_weekly_cardapio_request(normalized_msg):
+                return self._build_weekly_cardapio_response(cardapio)
+
+            day = self._extract_weekday(normalized_msg)
             if not day:
                 day = self._current_weekday_ptbr()
             day_menu = self._extract_day_menu(cardapio, day)
