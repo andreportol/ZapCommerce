@@ -62,13 +62,7 @@ class OrchestratorAgent:
     ) -> dict:
         phone_key = (telefone or "sessao_padrao").strip()
         conversation_state = get_or_create_state(phone_key)
-        if (
-            conversation_state.status_atendimento in {
-                AtendimentoStatus.FORA_HORARIO,
-                AtendimentoStatus.CONSULTANDO_CARDAPIO,
-            }
-            and self._is_acknowledgement(message)
-        ):
+        if self._is_acknowledgement(message) and not self._has_active_order_context(conversation_state):
             reset_state(phone_key)
             return {
                 "intent": "encerramento",
@@ -77,26 +71,48 @@ class OrchestratorAgent:
                 "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
                 "rag_results": [],
                 "file_info": None,
-                "final_response": "Certo 😊 Se precisar de algo mais, é só me chamar.",
+                "final_response": self._build_acknowledgement_response(conversation_state),
             }
 
-        if (
-            conversation_state.status_atendimento == AtendimentoStatus.FORA_HORARIO
-            and self._is_cardapio_confirmation_after_offer(message)
-        ):
+        if self._should_block_by_business_hours(message, conversation_state):
+            final_response = self._outside_business_hours_response(message, conversation_state)
+            if conversation_state.status_atendimento != AtendimentoStatus.INICIO:
+                reset_state(phone_key)
             update_state(
                 phone_key,
-                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
-                aguardando_resposta="cardapio",
+                status_atendimento=AtendimentoStatus.FORA_HORARIO,
+                aguardando_resposta="fora_horario",
+                ultima_intencao="fora_horario_informado",
             )
             return {
-                "intent": "consultando_cardapio",
-                "database": {"implemented": False, "message": "Cliente aceitou ver cardapio fora do horario.", "data": None},
+                "intent": "fora_horario",
+                "database": {"implemented": False, "message": "Atendimento fora do horario de pedidos.", "data": None},
                 "instructions": self.instructions_agent.get_instructions(),
                 "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
                 "rag_results": [],
                 "file_info": None,
-                "final_response": self._cardapio_after_hours_response(),
+                "final_response": final_response,
+            }
+
+        future_reservation_days = self._extract_future_contact_and_requested_days(message)
+        if (
+            future_reservation_days[0]
+            and future_reservation_days[1]
+            and not self._has_active_order_context(conversation_state)
+        ):
+            contact_day, requested_day = future_reservation_days
+            return {
+                "intent": "agendamento_contato_reserva",
+                "database": {"implemented": False, "message": "Cliente informou que vai chamar em outro dia para reservar.", "data": None},
+                "instructions": self.instructions_agent.get_instructions(),
+                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+                "rag_results": [],
+                "file_info": None,
+                "final_response": self._build_future_contact_reservation_response(
+                    message=message,
+                    contact_day=contact_day,
+                    requested_day=requested_day,
+                ),
             }
 
         if self._is_cancel_request(message):
@@ -116,8 +132,25 @@ class OrchestratorAgent:
                 ),
             }
 
+        if conversation_state.aguardando_resposta == "entrega_bairro_ou_endereco":
+            delivery_area_route = self._handle_delivery_area_followup(message=message, phone_key=phone_key)
+            if delivery_area_route is not None:
+                return delivery_area_route
+
         delivery_info_intent = self._detect_delivery_info_intent(message, conversation_state)
         if delivery_info_intent:
+            if delivery_info_intent == "entrega_geral":
+                update_state(
+                    phone_key,
+                    aguardando_resposta="entrega_bairro_ou_endereco",
+                    ultima_intencao="duvida_entrega",
+                )
+            else:
+                update_state(
+                    phone_key,
+                    aguardando_resposta="",
+                    ultima_intencao="",
+                )
             return {
                 "intent": "duvida_entrega_retirada",
                 "database": {"implemented": False, "message": "Resposta informativa sobre entrega/retirada.", "data": None},
@@ -126,24 +159,6 @@ class OrchestratorAgent:
                 "rag_results": [],
                 "file_info": None,
                 "final_response": self._build_delivery_info_response(delivery_info_intent),
-            }
-
-        if self._should_block_by_business_hours(message, conversation_state):
-            if conversation_state.status_atendimento != AtendimentoStatus.INICIO:
-                reset_state(phone_key)
-            update_state(
-                phone_key,
-                status_atendimento=AtendimentoStatus.FORA_HORARIO,
-                aguardando_resposta="fora_horario",
-            )
-            return {
-                "intent": "fora_horario",
-                "database": {"implemented": False, "message": "Atendimento fora do horario de pedidos.", "data": None},
-                "instructions": self.instructions_agent.get_instructions(),
-                "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
-                "rag_results": [],
-                "file_info": None,
-                "final_response": self._outside_business_hours_response(message, conversation_state),
             }
 
         if self._is_new_order_request(message):
@@ -184,6 +199,16 @@ class OrchestratorAgent:
                 "order_state": order_data.get("state"),
                 "final_response": response,
             }
+
+        if conversation_state.aguardando_resposta == "dia_cardapio":
+            cardapio_day_route = self._handle_cardapio_day_selection_context(
+                message=message,
+                phone_key=phone_key,
+                file_name=file_name,
+                file_mimetype=file_mimetype,
+            )
+            if cardapio_day_route is not None:
+                return cardapio_day_route
 
         analysis = self.message_agent.analyze(
             message,
@@ -259,16 +284,16 @@ class OrchestratorAgent:
             }
             and (analysis.menu_option == "2" or self._is_cardapio_followup(message))
         ):
-            update_state(
-                phone_key,
-                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
-                aguardando_resposta="cardapio",
-            )
             cardapio_message = "hoje" if analysis.menu_option == "2" else message
-            if analysis.menu_option == "2":
-                update_state(phone_key, ultima_intencao="consultar_cardapio")
-            else:
-                self._mark_last_consulted_cardapio_day(phone_key, cardapio_message)
+            cardapio_response_data = self._build_cardapio_response_data(
+                cardapio_message,
+                cardapio,
+                respect_business_hours=False,
+            )
+            self._update_cardapio_state_from_response(
+                phone_key=phone_key,
+                response_data=cardapio_response_data,
+            )
             return {
                 "intent": "consultando_cardapio",
                 "database": {"implemented": False, "message": "Consulta local de cardapio.", "data": None},
@@ -276,22 +301,21 @@ class OrchestratorAgent:
                 "cardapio_loaded": bool(cardapio),
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
-                "final_response": self._build_cardapio_response(
-                    cardapio_message,
-                    cardapio,
-                    respect_business_hours=False,
-                ),
+                "final_response": cardapio_response_data["response"],
             }
 
         if (
             conversation_state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO
             and self._is_cardapio_followup(message)
         ):
-            self._mark_last_consulted_cardapio_day(phone_key, message)
-            cardapio_response = self._build_cardapio_response(
+            cardapio_response_data = self._build_cardapio_response_data(
                 message,
                 cardapio,
                 respect_business_hours=False,
+            )
+            self._update_cardapio_state_from_response(
+                phone_key=phone_key,
+                response_data=cardapio_response_data,
             )
             return {
                 "intent": "consultando_cardapio",
@@ -300,7 +324,7 @@ class OrchestratorAgent:
                 "cardapio_loaded": bool(cardapio),
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
-                "final_response": cardapio_response,
+                "final_response": cardapio_response_data["response"],
             }
 
         if analysis.menu_option == "1" and conversation_state.status_atendimento == AtendimentoStatus.INICIO:
@@ -317,11 +341,14 @@ class OrchestratorAgent:
             }
 
         if analysis.menu_option == "2" and conversation_state.status_atendimento == AtendimentoStatus.INICIO:
-            update_state(
-                phone_key,
-                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
-                aguardando_resposta="cardapio",
-                ultima_intencao="consultar_cardapio",
+            cardapio_response_data = self._build_cardapio_response_data(
+                "hoje",
+                cardapio,
+                respect_business_hours=True,
+            )
+            self._update_cardapio_state_from_response(
+                phone_key=phone_key,
+                response_data=cardapio_response_data,
             )
             return {
                 "intent": "consultando_cardapio",
@@ -330,7 +357,7 @@ class OrchestratorAgent:
                 "cardapio_loaded": bool(cardapio),
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
-                "final_response": self._build_cardapio_response("hoje", cardapio, respect_business_hours=True),
+                "final_response": cardapio_response_data["response"],
             }
 
         if (
@@ -468,16 +495,16 @@ class OrchestratorAgent:
         file_mimetype: str,
     ) -> dict | None:
         if analysis.intencao == "consultar_cardapio":
-            update_state(
-                phone_key,
-                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
-                aguardando_resposta="cardapio",
-            )
             cardapio_message = "hoje" if getattr(analysis, "menu_option", "") == "2" else (analysis.mensagem_livre or message)
-            if getattr(analysis, "menu_option", "") == "2":
-                update_state(phone_key, ultima_intencao="consultar_cardapio")
-            else:
-                self._mark_last_consulted_cardapio_day(phone_key, cardapio_message)
+            cardapio_response_data = self._build_cardapio_response_data(
+                cardapio_message,
+                cardapio,
+                respect_business_hours=False,
+            )
+            self._update_cardapio_state_from_response(
+                phone_key=phone_key,
+                response_data=cardapio_response_data,
+            )
             return {
                 "intent": "consultando_cardapio",
                 "database": {"implemented": False, "message": "Consulta local de cardapio via intencao estruturada.", "data": None},
@@ -485,11 +512,7 @@ class OrchestratorAgent:
                 "cardapio_loaded": bool(cardapio),
                 "rag_results": rag_snippets,
                 "file_info": file_info.__dict__ if file_info else None,
-                "final_response": self._build_cardapio_response(
-                    cardapio_message,
-                    cardapio,
-                    respect_business_hours=False,
-                ),
+                "final_response": cardapio_response_data["response"],
             }
 
         if analysis.intencao == "consultar_preco":
@@ -722,6 +745,28 @@ class OrchestratorAgent:
             return True
         return self._is_within_business_hours_now()
 
+    def _has_active_order_context(self, state) -> bool:
+        if state is None:
+            return False
+        order_statuses = {
+            AtendimentoStatus.FAZENDO_PEDIDO,
+            AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA,
+            AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM,
+            AtendimentoStatus.AGUARDANDO_PRODUTO,
+            AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA,
+            AtendimentoStatus.AGUARDANDO_QUANTIDADE,
+            AtendimentoStatus.AGUARDANDO_ENDERECO,
+            AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+            AtendimentoStatus.AGUARDANDO_COMPROVANTE,
+            AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO,
+            AtendimentoStatus.AGUARDANDO_CONFIRMACAO,
+            AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO,
+        }
+        return (
+            getattr(state, "status_atendimento", "") in order_statuses
+            or getattr(state, "ultima_intencao", "") == "fazer_pedido"
+        )
+
     def _is_within_business_hours_now(self) -> bool:
         now = timezone.localtime()
         is_monday_to_saturday = 0 <= now.weekday() <= 5
@@ -744,25 +789,7 @@ class OrchestratorAgent:
         return True
 
     def _should_block_by_business_hours(self, message: str, state) -> bool:
-        if self._is_open_for_orders():
-            return False
-        text = self._normalize_short_text(message)
-        if self._is_price_followup_context(message, state):
-            return False
-        if self._is_price_question_context(message):
-            return False
-        order_attempt = self._is_business_hours_order_attempt(text)
-        if order_attempt:
-            return True
-        if text == "2" or self._is_cardapio_followup(message):
-            return False
-        if self._is_menu_request_during_order(message, state):
-            return False
-        if state.status_atendimento == AtendimentoStatus.CONSULTANDO_CARDAPIO and not order_attempt:
-            return False
-        if state.status_atendimento != AtendimentoStatus.INICIO or state.ultima_intencao == "fazer_pedido":
-            return True
-        return self._is_greeting(message) or order_attempt
+        return not self._is_open_for_orders()
 
     def _is_business_hours_order_attempt(self, normalized_text: str) -> bool:
         if normalized_text == "1":
@@ -897,86 +924,57 @@ class OrchestratorAgent:
             "Para confirmar se conseguimos entregar no seu endereço, me envie o endereço ou o bairro."
         )
 
+    def _handle_delivery_area_followup(self, message: str, phone_key: str) -> dict | None:
+        location_type, location_label = self._extract_delivery_location_details(message)
+        if not location_type:
+            return None
+
+        update_state(
+            phone_key,
+            aguardando_resposta="",
+            ultima_intencao="duvida_entrega",
+        )
+        if location_type == "bairro":
+            response = (
+                "Obrigado 😊 Ainda não consigo confirmar automaticamente a entrega por bairro.\n\n"
+                f"Para verificar a entrega no bairro {location_label}, envie o endereço completo ou fale com a atendente."
+            )
+        else:
+            response = (
+                "Obrigado 😊 Ainda não consigo confirmar automaticamente a entrega por endereço.\n\n"
+                "Para verificar a entrega nesse endereço, fale com a atendente."
+            )
+
+        return {
+            "intent": "duvida_entrega_retirada",
+            "database": {"implemented": False, "message": "Resposta de continuidade para bairro/endereco de entrega.", "data": None},
+            "instructions": self.instructions_agent.get_instructions(),
+            "cardapio_loaded": bool(self.cardapio_agent.get_cardapio()),
+            "rag_results": [],
+            "file_info": None,
+            "final_response": response,
+        }
+
     def _outside_business_hours_response(self, message: str, state=None) -> str:
-        normalized = self._normalize_short_text(message)
-        mentions_11h = self._mentions_time_11h(normalized)
-        mentions_pickup = self._mentions_pickup(normalized)
-        if self._is_reservation_intent(normalized) and self._extract_weekday(message):
-            requested_day = self._extract_weekday(message)
-            last_consulted_day = self._extract_last_consulted_day_from_state(state)
-            if last_consulted_day and requested_day and last_consulted_day != requested_day:
-                extra_hint = ""
-                if mentions_11h:
-                    extra_hint = "\n\nVocê também mencionou o horário de 11h."
-                return (
-                    "Percebi uma diferença 😊\n\n"
-                    f"Você consultou o cardápio de {self._display_weekday(last_consulted_day)}, "
-                    f"mas agora mencionou {self._display_weekday(requested_day)}.{extra_hint}\n\n"
-                    f"Você quer reservar o cardápio de {self._display_weekday(last_consulted_day)} "
-                    f"ou deseja consultar o cardápio de {self._display_weekday(requested_day)}?"
-                )
-            if last_consulted_day and requested_day and last_consulted_day == requested_day:
-                pickup_line = ""
-                if mentions_pickup and mentions_11h:
-                    pickup_line = (
-                        "\n\nAs retiradas acontecem das 11h às 13h, então a retirada às 11h está dentro do horário."
-                    )
-                return (
-                    "Que bom que gostou 😊\n\n"
-                    "Hoje não consigo registrar a encomenda, porque estamos fora do horário de pedidos.\n\n"
-                    f"Para reservar para {self._display_weekday(requested_day)}, por favor chame "
-                    f"na {self._display_weekday(requested_day).split('-')[0]} entre 9h e 12h30.\n\n"
-                    "Os pedidos/encomendas são feitos de segunda a sábado, das 9h às 12h30."
-                    f"{pickup_line}"
-                )
+        if self._is_human_request(message):
             return (
-                "Hoje não consigo registrar a encomenda, porque estamos fora do horário de pedidos.\n\n"
-                f"Para reservar para {self._display_weekday(requested_day)}, por favor chame "
-                f"na {self._display_weekday(requested_day).split('-')[0]} entre 9h e 12h30.\n\n"
-                "Os pedidos/encomendas são feitos de segunda a sábado, das 9h às 12h30."
+                "No momento estamos fora do horário de atendimento.\n\n"
+                "Deixe sua mensagem que a atendente responderá assim que possível."
             )
-        if self._is_reservation_intent(normalized):
-            last_consulted_day = self._extract_last_consulted_day_from_state(state)
-            if last_consulted_day:
-                return (
-                    "Que bom que gostou 😊\n\n"
-                    "Hoje não consigo registrar a encomenda, porque estamos fora do horário de pedidos.\n\n"
-                    f"Para reservar o cardápio de {self._display_weekday(last_consulted_day)}, "
-                    "por favor chame no dia entre 9h e 12h30.\n\n"
-                    "Se preferir, me diga outro dia da semana para eu te mostrar o cardápio."
-                )
-        asserted_today = self._extract_asserted_today_weekday(message)
-        current_day = self._current_weekday_ptbr()
-        if asserted_today and asserted_today != current_day:
+        if self._has_outside_hours_marker(state):
             return (
-                f"{self._system_today_sentence()} "
-                "Mesmo assim, os pedidos/encomendas precisam ser feitos dentro do horário de atendimento:\n\n"
-                "Pedidos/encomendas: segunda a sábado, das 9h às 12h30.\n"
-                "Entregas e retiradas: das 11h às 13h."
-            )
-        if self._is_greeting(message):
-            return (
-                "No momento estamos fora do horário de pedidos.\n\n"
-                "Pedidos/encomendas:\n"
-                "segunda a sábado, das 9h às 12h30.\n\n"
-                "Entregas e retiradas:\n"
-                "das 11h às 13h.\n\n"
-                "Se quiser, posso te mostrar o cardápio disponível da semana. Para isso, digite 2."
-            )
-        if self._extract_weekday(message):
-            return (
-                "Mesmo para outro dia, os pedidos/encomendas precisam ser feitos dentro do horário de atendimento.\n\n"
-                "Pedidos/encomendas: segunda a sábado, das 9h às 12h30.\n"
-                "Entregas e retiradas: das 11h às 13h.\n"
-                "Por favor, chame dentro do horário de pedidos para fazer sua encomenda."
+                "Ainda estamos fora do horário de atendimento 😊\n\n"
+                "Por favor, chame de segunda a sábado, das 9h às 12h30, para consultar cardápio, valores, entrega ou fazer pedidos."
             )
         return (
-            "No momento estamos fora do horário de pedidos.\n\n"
+            "Olá! 😊\n\n"
+            "No momento estamos fora do horário de atendimento.\n\n"
             "Pedidos/encomendas:\n"
             "segunda a sábado, das 9h às 12h30.\n\n"
             "Entregas e retiradas:\n"
             "das 11h às 13h.\n\n"
-            "Se quiser, posso te mostrar o cardápio disponível da semana. Para isso, digite 2."
+            "Por favor, chame dentro do horário para fazer pedidos, consultar cardápios, valores ou informações sobre entrega.\n\n"
+            "Se quiser, deixe sua mensagem que a atendente responderá assim que possível."
         )
 
     def _adjust_price_response_outside_business_hours(self, response: str) -> str:
@@ -993,6 +991,19 @@ class OrchestratorAgent:
         return (
             f"{text}\n\n"
             "Pedidos/encomendas podem ser feitos de segunda a sábado, das 9h às 12h30."
+        )
+
+    def _build_acknowledgement_response(self, state) -> str:
+        if getattr(state, "status_atendimento", "") == AtendimentoStatus.FORA_HORARIO or not self._is_open_for_orders():
+            return "Combinado 😊\nQuando estiver dentro do horário, é só me chamar."
+        return "Combinado 😊\nQuando quiser, é só me chamar."
+
+    def _build_future_contact_reservation_response(self, message: str, contact_day: str, requested_day: str) -> str:
+        subject = self._build_reservation_subject(message, requested_day)
+        return (
+            "Perfeito 😊\n\n"
+            f"{self._weekday_with_contact_preposition(contact_day)}, entre 9h e 12h30, você pode me chamar para reservar {subject}.\n\n"
+            "Os pedidos/encomendas são feitos de segunda a sábado, das 9h às 12h30."
         )
 
     def _build_price_response(self, message: str) -> str:
@@ -1045,6 +1056,26 @@ class OrchestratorAgent:
             4: "quatro",
             5: "cinco",
         }.get(number, str(number))
+
+    def _is_human_request(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        return any(
+            term in text
+            for term in [
+                "atendente",
+                "atendimento humano",
+                "falar com alguem",
+                "falar com alguém",
+                "falar com uma pessoa",
+                "falar com pessoa",
+                "falar com humano",
+            ]
+        )
+
+    def _has_outside_hours_marker(self, state) -> bool:
+        if state is None:
+            return False
+        return (getattr(state, "ultima_intencao", "") or "").strip() == "fora_horario_informado"
 
     def _is_acknowledgement(self, message: str) -> bool:
         text = self._normalize_short_text(message)
@@ -1119,33 +1150,78 @@ class OrchestratorAgent:
         return (
             self._is_today_request(text)
             or self._is_weekly_cardapio_request(text)
+            or self._is_other_day_request(text)
             or bool(self._extract_weekday(text))
             or "cardapio" in text
             or "menu" in text
             or "prato" in text
         )
 
+    def _is_other_day_request(self, normalized_text: str) -> bool:
+        return normalized_text in {
+            "quero ver outro dia",
+            "me mostra outro dia",
+            "mostrar outro dia",
+            "ver outro dia",
+            "outro dia",
+        }
+
     def _is_today_request(self, normalized_text: str) -> bool:
         return normalized_text in {"hoje", "o de hoje", "de hoje", "cardapio de hoje", "menu de hoje"} or "hoje" in normalized_text
 
     def _build_cardapio_response(self, message: str, cardapio: str, respect_business_hours: bool = True) -> str:
+        return self._build_cardapio_response_data(
+            message,
+            cardapio,
+            respect_business_hours=respect_business_hours,
+        )["response"]
+
+    def _build_cardapio_response_data(self, message: str, cardapio: str, respect_business_hours: bool = True) -> dict:
         normalized = self._normalize_short_text(message)
         if self._is_weekly_cardapio_request(normalized):
-            return self._build_weekly_cardapio_response(cardapio)
+            return {
+                "response": self._build_weekly_cardapio_response(cardapio),
+                "resolved_day": "",
+                "awaiting_day_selection": False,
+            }
+        if self._is_other_day_request(normalized):
+            available_days = self._available_weekdays_from_cardapio(cardapio)
+            if available_days:
+                day_lines = [
+                    f"{self._weekday_to_menu_number(day_name)} - {self._display_weekday(day_name).capitalize()}"
+                    for day_name in available_days
+                ]
+                return {
+                    "response": (
+                        "Cardápios disponíveis:\n"
+                        f"{chr(10).join(day_lines)}\n\n"
+                        "Digite o número ou o nome do dia que deseja consultar."
+                    ),
+                    "resolved_day": "",
+                    "awaiting_day_selection": True,
+                }
 
         asserted_today = self._extract_asserted_today_weekday(message or "")
         current_day = self._current_weekday_ptbr()
         if asserted_today and asserted_today != current_day:
             suggested_day = asserted_today
-            return (
-                f"{self._system_today_sentence()}\n\n"
-                "Por isso, não há cardápio cadastrado para hoje.\n\n"
-                f"Posso te mostrar o cardápio de {self._display_weekday(suggested_day)} ou de outro dia da semana."
-            )
+            return {
+                "response": (
+                    f"{self._system_today_sentence()}\n\n"
+                    "Por isso, não há cardápio cadastrado para hoje.\n\n"
+                    f"Posso te mostrar o cardápio de {self._display_weekday(suggested_day)} ou de outro dia da semana."
+                ),
+                "resolved_day": "",
+                "awaiting_day_selection": False,
+            }
 
         day = self._extract_weekday(message or "")
         if respect_business_hours and not self._is_open_for_orders() and (not day or self._is_today_request(normalized)):
-            return self._cardapio_after_hours_response()
+            return {
+                "response": self._cardapio_after_hours_response(),
+                "resolved_day": "",
+                "awaiting_day_selection": False,
+            }
 
         if not day or self._is_today_request(normalized):
             day = self._current_weekday_ptbr()
@@ -1158,15 +1234,30 @@ class OrchestratorAgent:
             if not day or self._is_today_request(normalized):
                 available_days = self._available_weekdays_from_cardapio(cardapio)
                 if available_days:
-                    day_lines = [f"{idx} - {self._display_weekday(day_name).capitalize()}" for idx, day_name in enumerate(available_days, start=1)]
-                    return (
-                        "Hoje não temos cardápio cadastrado.\n\n"
-                        "Cardápios disponíveis:\n"
-                        f"{chr(10).join(day_lines)}\n\n"
-                        "Digite o dia que deseja consultar."
-                    )
-            return "Não encontrei cardápio cadastrado para esse dia. Você deseja consultar outro dia da semana?"
-        return f"{prefix}\n\n{day_menu}"
+                    day_lines = [
+                        f"{self._weekday_to_menu_number(day_name)} - {self._display_weekday(day_name).capitalize()}"
+                        for day_name in available_days
+                    ]
+                    return {
+                        "response": (
+                            "Hoje não temos cardápio cadastrado.\n\n"
+                            "Cardápios disponíveis:\n"
+                            f"{chr(10).join(day_lines)}\n\n"
+                            "Digite o número ou o nome do dia que deseja consultar."
+                        ),
+                        "resolved_day": "",
+                        "awaiting_day_selection": True,
+                    }
+            return {
+                "response": "Não encontrei cardápio cadastrado para esse dia. Você deseja consultar outro dia da semana?",
+                "resolved_day": "",
+                "awaiting_day_selection": False,
+            }
+        return {
+            "response": f"{prefix}\n\n{day_menu}",
+            "resolved_day": day,
+            "awaiting_day_selection": False,
+        }
 
     def _cardapio_after_hours_response(self) -> str:
         return (
@@ -1407,6 +1498,69 @@ class OrchestratorAgent:
 
         return ""
 
+    def _handle_cardapio_day_selection_context(
+        self,
+        message: str,
+        phone_key: str,
+        file_name: str = "",
+        file_mimetype: str = "",
+    ) -> dict | None:
+        day = self._extract_cardapio_day_selection(message)
+        if not day:
+            return None
+
+        instructions = self.instructions_agent.get_instructions()
+        cardapio = self.cardapio_agent.get_cardapio()
+        rag_snippets = self.rag_agent.search(message, top_k=4).get("results", [])
+        file_info = self.file_agent.parse_file_info(file_name, file_mimetype) if (file_name or file_mimetype) else None
+        cardapio_response_data = self._build_cardapio_response_data(
+            day,
+            cardapio,
+            respect_business_hours=False,
+        )
+        update_state(
+            phone_key,
+            status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+            ultima_intencao=f"consultar_cardapio:{day}",
+            aguardando_resposta="",
+        )
+        return {
+            "intent": "consultando_cardapio",
+            "database": {"implemented": False, "message": "Consulta local de cardapio por escolha de dia.", "data": None},
+            "instructions": instructions,
+            "cardapio_loaded": bool(cardapio),
+            "rag_results": rag_snippets,
+            "file_info": file_info.__dict__ if file_info else None,
+            "final_response": cardapio_response_data["response"],
+        }
+
+    def _update_cardapio_state_from_response(self, phone_key: str, response_data: dict) -> None:
+        if response_data.get("awaiting_day_selection"):
+            update_state(
+                phone_key,
+                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+                aguardando_resposta="dia_cardapio",
+                ultima_intencao="consultar_cardapio",
+            )
+            return
+
+        resolved_day = (response_data.get("resolved_day") or "").strip()
+        if resolved_day:
+            update_state(
+                phone_key,
+                status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+                aguardando_resposta="",
+                ultima_intencao=f"consultar_cardapio:{resolved_day}",
+            )
+            return
+
+        update_state(
+            phone_key,
+            status_atendimento=AtendimentoStatus.CONSULTANDO_CARDAPIO,
+            aguardando_resposta="cardapio",
+            ultima_intencao="consultar_cardapio",
+        )
+
     def _extract_people_count(self, text: str) -> int | None:
         m = re.search(r"\b(\d{1,2})\s*pessoas?\b", text)
         if not m:
@@ -1419,6 +1573,124 @@ class OrchestratorAgent:
         if not m:
             return ""
         return m.group(1).upper().replace("  ", " ")
+
+    def _extract_cardapio_day_selection(self, text: str) -> str:
+        normalized = self._normalize_short_text(text)
+        day_by_number = self._cardapio_day_number_map()
+        if normalized in day_by_number:
+            return day_by_number[normalized]
+        return self._extract_weekday(text)
+
+    def _extract_delivery_location_details(self, text: str) -> tuple[str, str]:
+        original = (text or "").strip()
+        normalized = self._normalize_short_text(text)
+        if not normalized:
+            return "", ""
+
+        bairro_match = re.search(r"\bbairro\s+(.+)$", original, flags=re.IGNORECASE)
+        if bairro_match:
+            return "bairro", self._format_location_label(bairro_match.group(1))
+
+        address_markers = ["rua", "avenida", "av ", "travessa", "numero", "nº", "cep"]
+        if any(marker in normalized for marker in address_markers):
+            return "endereco", original
+
+        tokens = normalized.split()
+        if 1 <= len(tokens) <= 3 and not any(token.isdigit() for token in tokens):
+            return "bairro", self._format_location_label(original)
+        return "", ""
+
+    def _extract_future_contact_and_requested_days(self, text: str) -> tuple[str, str]:
+        normalized = self._normalize_short_text(text)
+        if not normalized:
+            return "", ""
+
+        contact_markers = [
+            "te envio",
+            "envio uma mensagem",
+            "mando mensagem",
+            "te mando",
+            "te chamo",
+            "vou te chamar",
+            "vou chamar",
+            "eu chamo",
+            "eu mando",
+            "eu te mando",
+            "eu te envio",
+            "falo com voce",
+        ]
+        reservation_markers = ["reservar", "pedido", "pedir", "marmitex", "marmita", "cardapio", "menu"]
+        if not any(marker in normalized for marker in contact_markers):
+            return "", ""
+        if not any(marker in normalized for marker in reservation_markers):
+            return "", ""
+
+        ordered_days = self._extract_weekdays_in_text_order(text)
+        if len(ordered_days) < 2:
+            return "", ""
+        return ordered_days[0], ordered_days[-1]
+
+    def _extract_weekdays_in_text_order(self, text: str) -> list[str]:
+        normalized = self._normalize_short_text(text)
+        aliases = {
+            "segunda-feira": ["segunda feira", "segunda-feira", "segunda"],
+            "terca-feira": ["terca feira", "terca-feira", "terca", "terça feira", "terça-feira", "terça"],
+            "quarta-feira": ["quarta feira", "quarta-feira", "quarta"],
+            "quinta-feira": ["quinta feira", "quinta-feira", "quinta"],
+            "sexta-feira": ["sexta feira", "sexta-feira", "sexta"],
+            "sabado": ["sabado", "sabado feira", "sábado", "sábado feira"],
+            "domingo": ["domingo"],
+        }
+        hits: list[tuple[int, str]] = []
+        for canonical, values in aliases.items():
+            first_pos = None
+            for value in values:
+                match = re.search(rf"\b{re.escape(self._normalize_short_text(value))}\b", normalized)
+                if match and (first_pos is None or match.start() < first_pos):
+                    first_pos = match.start()
+            if first_pos is not None:
+                hits.append((first_pos, canonical))
+        hits.sort(key=lambda item: item[0])
+        return [day for _, day in hits]
+
+    def _build_reservation_subject(self, message: str, requested_day: str) -> str:
+        normalized = self._normalize_short_text(message)
+        displayed_day = self._display_weekday(requested_day)
+        if "marmitex" in normalized:
+            return f"a marmitex de {displayed_day}"
+        if "marmita" in normalized:
+            return f"a marmita de {displayed_day}"
+        return f"o cardápio de {displayed_day}"
+
+    def _weekday_with_contact_preposition(self, day: str) -> str:
+        displayed_day = self._display_weekday(day)
+        if day in {"sabado", "domingo"}:
+            return f"No {displayed_day}"
+        return f"Na {displayed_day}"
+
+    def _weekday_short_with_contact_preposition(self, day: str) -> str:
+        displayed_day = self._display_weekday(day).split("-")[0]
+        if day in {"sabado", "domingo"}:
+            return f"no {displayed_day}"
+        return f"na {displayed_day}"
+
+    def _format_location_label(self, text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", (text or "").strip(" .,:;-")).strip()
+        return cleaned.title()
+
+    def _cardapio_day_number_map(self) -> dict[str, str]:
+        return {
+            "1": "segunda-feira",
+            "2": "terca-feira",
+            "3": "quarta-feira",
+            "4": "quinta-feira",
+            "5": "sexta-feira",
+            "6": "sabado",
+        }
+
+    def _weekday_to_menu_number(self, day: str) -> str:
+        reverse_map = {value: key for key, value in self._cardapio_day_number_map().items()}
+        return reverse_map.get(day, "")
 
     def _extract_weekday(self, text: str) -> str:
         normalized = self._normalize_short_text(text)
