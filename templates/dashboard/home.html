@@ -1,0 +1,157 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dashboard | Marmitaria da Adriana</title>
+    <meta name="description" content="Painel inicial da Marmitaria da Adriana.">
+    <link rel="stylesheet" href="{% static 'app/css/landing.css' %}">
+    <link rel="stylesheet" href="{% static 'app/css/dashboard.css' %}">
+</head>
+<body>
+    <div class="page-shell dashboard-shell">
+        <header class="dashboard-header">
+            <div>
+                <p class="eyebrow">Área administrativa</p>
+                <a class="brand" href="/dashboard/">Marmitaria da Adriana</a>
+            </div>
+            <div class="dashboard-header-actions">
+                <span class="dashboard-user">{{ request.user.get_username }}</span>
+                <a class="header-link" href="/logout/">Sair</a>
+            </div>
+        </header>
+
+        <main class="dashboard-main">
+            <section class="dashboard-hero">
+                <div class="dashboard-hero-card">
+                    <p class="eyebrow">Visão geral</p>
+                    <h1>Dashboard inicial da operação</h1>
+                    <p>
+                        Acompanhe os números principais da marmitaria e prepare a base para o painel completo.
+                    </p>
+                    <div class="dashboard-meta">
+                        <span>Data de referência: {{ today_label }}</span>
+                    </div>
+                </div>
+            </section>
+
+            {% if dashboard_notice %}
+                <section class="dashboard-feedback">
+                    <div class="dashboard-feedback-card">
+                        {% if dashboard_notice == 'pagamento_confirmado' %}
+                            Pagamento confirmado. O pedido foi enviado para preparo.
+                        {% elif dashboard_notice == 'pedido_em_preparo' %}
+                            Pedido atualizado para preparo.
+                        {% elif dashboard_notice == 'pedido_finalizado' %}
+                            Pedido finalizado com sucesso.
+                        {% elif dashboard_notice == 'status_invalido' %}
+                            Não foi possível atualizar este pedido porque o status atual não permite essa ação.
+                        {% else %}
+                            Ação do dashboard não reconhecida.
+                        {% endif %}
+                    </div>
+                </section>
+            {% endif %}
+
+            <section class="dashboard-cards">
+                {% for card in dashboard_cards %}
+                    <article class="metric-card">
+                        <p class="metric-label">{{ card.label }}</p>
+                        <strong class="metric-value">{{ card.value }}</strong>
+                        <p class="metric-description">{{ card.description }}</p>
+                    </article>
+                {% endfor %}
+            </section>
+
+            <section class="dashboard-panel">
+                <div class="dashboard-panel-card">
+                    <div class="panel-heading">
+                        <div>
+                            <p class="eyebrow">Status dos pedidos</p>
+                            <h2>Marcadores da operação de hoje</h2>
+                        </div>
+                        <span class="dashboard-meta">Atualizado para {{ today_label }}</span>
+                    </div>
+                    <div class="status-marker-grid">
+                        {% for marker in status_markers %}
+                            <article class="status-marker-card">
+                                <span class="status-pill {{ marker.tone }}">{{ marker.label }}</span>
+                                <strong class="status-marker-value">{{ marker.value }}</strong>
+                                <p class="status-marker-description">{{ marker.description }}</p>
+                            </article>
+                        {% endfor %}
+                    </div>
+                </div>
+            </section>
+
+            <section class="dashboard-panel">
+                <div class="dashboard-panel-card">
+                    <div class="panel-heading">
+                        <div>
+                            <p class="eyebrow">Pedidos do dia</p>
+                            <h2>Acompanhamento rápido da fila</h2>
+                        </div>
+                    </div>
+                    {% if recent_orders %}
+                        <div class="orders-table-wrap">
+                            <table class="orders-table">
+                                <thead>
+                                    <tr>
+                                        <th>Pedido</th>
+                                        <th>Cliente</th>
+                                        <th>Hora</th>
+                                        <th>Recebimento</th>
+                                        <th>Pagamento</th>
+                                        <th>Status</th>
+                                        <th>Total</th>
+                                        <th>Ações</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for order in recent_orders %}
+                                        <tr>
+                                            <td>#{{ order.id }}</td>
+                                            <td>{{ order.client_name }}</td>
+                                            <td>{{ order.created_at }}</td>
+                                            <td>{{ order.fulfillment }}</td>
+                                            <td>{{ order.payment }}</td>
+                                            <td>
+                                                <span class="status-pill {{ order.status_tone }}">
+                                                    {{ order.status_label }}
+                                                </span>
+                                            </td>
+                                            <td>{{ order.total }}</td>
+                                            <td>
+                                                {% if order.actions %}
+                                                    <div class="order-actions">
+                                                        {% for action in order.actions %}
+                                                            <form method="post" action="{% url 'dashboard_update_order_status' order.id %}">
+                                                                {% csrf_token %}
+                                                                <input type="hidden" name="action" value="{{ action.value }}">
+                                                                <button type="submit" class="dashboard-action-btn {{ action.tone }}">
+                                                                    {{ action.label }}
+                                                                </button>
+                                                            </form>
+                                                        {% endfor %}
+                                                    </div>
+                                                {% else %}
+                                                    <span class="order-actions-empty">Sem ação</span>
+                                                {% endif %}
+                                            </td>
+                                        </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    {% else %}
+                        <p class="empty-orders-state">
+                            Nenhum pedido foi registrado hoje. Assim que os pedidos entrarem, os status aparecerão aqui.
+                        </p>
+                    {% endif %}
+                </div>
+            </section>
+        </main>
+    </div>
+</body>
+</html>

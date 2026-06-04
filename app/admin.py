@@ -2,7 +2,18 @@ from django.contrib import admin
 from django.db import transaction
 
 from .agents.conversation_state import clear_all_states
-from .models import Cliente, ConfiguracaoMarmitaria, Conversa, EstadoConversa, ItemPedido, Mensagem, Pedido, Produto
+from .models import (
+    CardapioDia,
+    Cliente,
+    ConfiguracaoMarmitaria,
+    Conversa,
+    EstadoConversa,
+    HorarioFuncionamentoDia,
+    ItemPedido,
+    Mensagem,
+    Pedido,
+    Produto,
+)
 
 
 @admin.action(description='Limpar todo o historico de conversas')
@@ -73,6 +84,28 @@ class ItemPedidoInline(admin.TabularInline):
     readonly_fields = ('subtotal',)
 
 
+class HorarioFuncionamentoDiaInline(admin.TabularInline):
+    model = HorarioFuncionamentoDia
+    extra = 0
+    fields = (
+        'dia_semana',
+        'fechado',
+        'abre_pedidos',
+        'fecha_pedidos',
+        'abre_entregas',
+        'fecha_entregas',
+        'abre_retiradas',
+        'fecha_retiradas',
+        'observacoes',
+    )
+
+
+class CardapioDiaInline(admin.StackedInline):
+    model = CardapioDia
+    extra = 0
+    fields = ('dia_semana', 'titulo', 'descricao', 'ativo')
+
+
 @admin.register(Pedido)
 class PedidoAdmin(admin.ModelAdmin):
     list_display = ('id', 'cliente', 'status', 'forma_pagamento', 'total', 'criado_em')
@@ -93,9 +126,82 @@ class MensagemAdmin(admin.ModelAdmin):
 
 @admin.register(ConfiguracaoMarmitaria)
 class ConfiguracaoMarmitariaAdmin(admin.ModelAdmin):
-    list_display = ('id', 'nome_empresa', 'telefone_atendimento', 'taxa_entrega_padrao', 'ativo', 'atualizado_em')
+    list_display = (
+        'id',
+        'nome_empresa',
+        'telefone_atendimento',
+        'aceita_pedidos',
+        'aceita_entrega',
+        'aceita_retirada_local',
+        'taxa_entrega_padrao',
+        'ativo',
+        'atualizado_em',
+    )
     search_fields = ('nome_empresa', 'telefone_atendimento')
     list_filter = ('ativo',)
+    readonly_fields = ('criado_em', 'atualizado_em')
+    inlines = [HorarioFuncionamentoDiaInline, CardapioDiaInline]
+    fieldsets = (
+        (
+            'Identificacao',
+            {
+                'fields': (
+                    'nome_empresa',
+                    'telefone_atendimento',
+                    'ativo',
+                )
+            },
+        ),
+        (
+            'Operacao',
+            {
+                'fields': (
+                    'aceita_pedidos',
+                    'aceita_entrega',
+                    'aceita_retirada_local',
+                    'pedido_maximo_sem_consulta',
+                    'taxa_entrega_padrao',
+                    'endereco_retirada',
+                    'horario_funcionamento',
+                )
+            },
+        ),
+        (
+            'Mensagens E Pagamento',
+            {
+                'fields': (
+                    'chave_pix',
+                    'mensagem_boas_vindas',
+                    'mensagem_fora_horario',
+                )
+            },
+        ),
+        ('Auditoria', {'fields': ('criado_em', 'atualizado_em')}),
+    )
+
+
+@admin.register(HorarioFuncionamentoDia)
+class HorarioFuncionamentoDiaAdmin(admin.ModelAdmin):
+    list_display = (
+        'id',
+        'configuracao',
+        'dia_semana',
+        'fechado',
+        'abre_pedidos',
+        'fecha_pedidos',
+        'abre_entregas',
+        'fecha_entregas',
+    )
+    list_filter = ('configuracao', 'fechado', 'dia_semana')
+    search_fields = ('configuracao__nome_empresa', 'observacoes')
+    readonly_fields = ('criado_em', 'atualizado_em')
+
+
+@admin.register(CardapioDia)
+class CardapioDiaAdmin(admin.ModelAdmin):
+    list_display = ('id', 'configuracao', 'dia_semana', 'titulo', 'ativo', 'atualizado_em')
+    list_filter = ('configuracao', 'ativo', 'dia_semana')
+    search_fields = ('configuracao__nome_empresa', 'titulo', 'descricao')
     readonly_fields = ('criado_em', 'atualizado_em')
 
 

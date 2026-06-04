@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from django.test import SimpleTestCase
 
@@ -7,6 +7,7 @@ from app.agents.conversation_state import AtendimentoStatus
 from app.agents.orchestrator_agent import OrchestratorAgent
 import app.agents.orchestrator_agent as orchestrator_module
 import app.agents.order_agent as order_module
+import app.services as services_module
 
 
 class CardapioDayContextTests(SimpleTestCase):
@@ -25,16 +26,20 @@ class CardapioDayContextTests(SimpleTestCase):
         endereco: str = ""
         forma_pagamento: str = ""
         aguardando_resposta: str = ""
+        atualizado_em: datetime = field(default_factory=datetime.utcnow)
 
     def setUp(self) -> None:
         super().setUp()
         self._store: dict[str, CardapioDayContextTests._FakeState] = {}
+        self._customer_names: dict[str, str] = {}
         self._original_orch_get = orchestrator_module.get_or_create_state
         self._original_orch_update = orchestrator_module.update_state
         self._original_orch_reset = orchestrator_module.reset_state
         self._original_order_get = order_module.get_or_create_state
         self._original_order_update = order_module.update_state
         self._original_order_reset = order_module.reset_state
+        self._original_order_get_customer_name = order_module.OrderAgent._get_customer_name
+        self._original_order_set_customer_name = order_module.OrderAgent._set_customer_name
         self._original_localdate = orchestrator_module.timezone.localdate
         self._original_orch_get_order_product = orchestrator_module.get_order_product
         self._original_orch_get_order_product_by_people = orchestrator_module.get_order_product_by_people
@@ -46,6 +51,7 @@ class CardapioDayContextTests(SimpleTestCase):
         self._original_order_get_order_product_choices = order_module.get_order_product_choices
         self._original_order_list_order_products = order_module.list_order_products
         self._original_order_format_brl = order_module.format_brl
+        self._original_service_handle_message = services_module.orchestrator_agent.handle_message
         self._mount_fake_runtime()
 
         self.orchestrator = OrchestratorAgent()
@@ -55,13 +61,13 @@ class CardapioDayContextTests(SimpleTestCase):
             "## segunda-feira\n"
             "- Feijoada\n- Arroz\n- Farofa\n"
             "## terca-feira\n"
-            "- Frango grelhado\n- Arroz\n- Feijao\n"
+            "- Frango grelhado\n- Arroz\n- Feijão\n"
             "## quarta-feira\n"
-            "- Bife acebolado\n- Arroz\n- Feijao tropeiro\n"
+            "- Bife acebolado\n- Arroz\n- Feijão tropeiro\n"
             "## quinta-feira\n"
             "- Strogonoff\n- Arroz\n- Batata palha\n"
             "## sexta-feira\n"
-            "- Peixe frito\n- Arroz\n- Pure\n"
+            "- Peixe frito\n- Arroz\n- Purê de batata\n"
             "## sabado\n"
             "- Costela assada\n- Arroz\n- Mandioca\n"
         )
@@ -87,6 +93,9 @@ class CardapioDayContextTests(SimpleTestCase):
         order_module.get_order_product_choices = self._original_order_get_order_product_choices
         order_module.list_order_products = self._original_order_list_order_products
         order_module.format_brl = self._original_order_format_brl
+        services_module.orchestrator_agent.handle_message = self._original_service_handle_message
+        order_module.OrderAgent._get_customer_name = self._original_order_get_customer_name
+        order_module.OrderAgent._set_customer_name = self._original_order_set_customer_name
         super().tearDown()
 
     def test_menu_option_two_lists_days_and_saves_day_context(self) -> None:
@@ -138,6 +147,144 @@ class CardapioDayContextTests(SimpleTestCase):
         self.assertEqual(state.ultima_intencao, "consultar_cardapio")
         self.assertEqual(state.aguardando_resposta, "dia_cardapio")
 
+    def test_greeting_followed_by_option_two_opens_cardapio_flow(self) -> None:
+        telefone = "5511999990030"
+
+        self.orchestrator.handle_message("Oi", telefone=telefone)
+        result = self.orchestrator.handle_message("2", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Cardápios disponíveis:", result["final_response"])
+        self.assertNotIn("Como posso ajudar?", result["final_response"])
+        self.assertEqual(state.ultima_intencao, "consultar_cardapio")
+        self.assertEqual(state.aguardando_resposta, "dia_cardapio")
+
+    def test_greeting_followed_by_option_one_starts_order_flow(self) -> None:
+        telefone = "5511999990032"
+
+        first = self.orchestrator.handle_message("Oi", telefone=telefone)
+        result = self.orchestrator.handle_message("1", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("1 - Fazer pedido", first["final_response"])
+        self.assertIn("Perfeito", result["final_response"])
+        self.assertIn("Você deseja:", result["final_response"])
+        self.assertIn("Marmitex Individual", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.AGUARDANDO_PRODUTO)
+        self.assertEqual(state.ultima_intencao, "fazer_pedido")
+
+    def test_greeting_followed_by_option_two_shows_todays_menu(self) -> None:
+        telefone = "5511999990033"
+        original_localdate = orchestrator_module.timezone.localdate
+        orchestrator_module.timezone.localdate = lambda: date(2026, 6, 1)
+
+        try:
+            self.orchestrator.handle_message("Oi", telefone=telefone)
+            result = self.orchestrator.handle_message("2", telefone=telefone)
+            state = self._store[telefone]
+        finally:
+            orchestrator_module.timezone.localdate = original_localdate
+
+        self.assertIn("O cardápio de hoje é", result["final_response"])
+        self.assertIn("Feijoada", result["final_response"])
+        self.assertEqual(state.ultima_intencao, "consultar_cardapio:segunda-feira")
+        self.assertEqual(state.aguardando_resposta, "")
+
+    def test_option_two_with_whatsapp_formatting_character_still_opens_cardapio(self) -> None:
+        result = self.orchestrator.handle_message("\u200e2.", telefone="5511999990031")
+        state = self._store["5511999990031"]
+
+        self.assertIn("Cardápios disponíveis:", result["final_response"])
+        self.assertNotIn("Como posso ajudar?", result["final_response"])
+        self.assertEqual(state.ultima_intencao, "consultar_cardapio")
+        self.assertEqual(state.aguardando_resposta, "dia_cardapio")
+
+    def test_cardapio_then_hours_question_returns_hours_instead_of_menu(self) -> None:
+        telefone = "5511999990034"
+
+        self.orchestrator.handle_message("Oi", telefone=telefone)
+        second = self.orchestrator.handle_message("2", telefone=telefone)
+        result = self.orchestrator.handle_message("Qual o horário de funcionamento?", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Cardápios disponíveis:", second["final_response"])
+        self.assertIn("Funcionamos nos seguintes horários:", result["final_response"])
+        self.assertIn("Pedidos/encomendas:", result["final_response"])
+        self.assertIn("Entregas e retiradas:", result["final_response"])
+        self.assertNotIn("Como posso ajudar?", result["final_response"])
+        self.assertEqual(state.ultima_intencao, "consultar_horario")
+
+    def test_opening_hours_question_returns_hours(self) -> None:
+        result = self.orchestrator.handle_message("Que horas abre?", telefone="5511999990035")
+        self.assertIn("Funcionamos nos seguintes horários:", result["final_response"])
+        self.assertIn("* Segunda-feira: 9h às 12h30", result["final_response"])
+
+    def test_menu_option_three_returns_numbered_information_list(self) -> None:
+        telefone = "5511999990055"
+
+        first = self.orchestrator.handle_message("Oi", telefone=telefone)
+        result = self.orchestrator.handle_message("3", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("1 - Fazer pedido", first["final_response"])
+        self.assertIn("Trabalhamos com as seguintes opções", result["final_response"])
+        self.assertIn("1 - Marmitex Individual", result["final_response"])
+        self.assertIn("2 - Marmita para 2 pessoas", result["final_response"])
+        self.assertIn("5 - Marmita para 5 pessoas", result["final_response"])
+        self.assertIn("proprietária", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.INICIO)
+        self.assertEqual(state.ultima_intencao, "menu_principal")
+
+    def test_cardapio_followup_quantity_for_specific_day_starts_order(self) -> None:
+        telefone = "5511999990051"
+
+        cardapio = self.orchestrator.handle_message("Eu quero o cardápio de quinta-feira", telefone=telefone)
+        result = self.orchestrator.handle_message("Eu quero duas", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("O cardápio de quinta-feira é:", cardapio["final_response"])
+        self.assertIn("Seu pedido ficou assim", result["final_response"])
+        self.assertIn("* 2 marmitex individuais: R$ 42,00", result["final_response"])
+        self.assertIn("Você prefere:", result["final_response"])
+        self.assertIn("cardápio de quinta-feira", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
+        self.assertEqual(state.ultima_intencao, "fazer_pedido")
+
+    def test_cardapio_followup_quantity_for_today_starts_order(self) -> None:
+        telefone = "5511999990052"
+        original_localdate = orchestrator_module.timezone.localdate
+        orchestrator_module.timezone.localdate = lambda: date(2026, 6, 6)
+
+        try:
+            cardapio = self.orchestrator.handle_message("2", telefone=telefone)
+            result = self.orchestrator.handle_message("quero duas", telefone=telefone)
+            state = self._store[telefone]
+        finally:
+            orchestrator_module.timezone.localdate = original_localdate
+
+        self.assertIn("O cardápio de hoje é:", cardapio["final_response"])
+        self.assertIn("Seu pedido ficou assim", result["final_response"])
+        self.assertIn("* 2 marmitex individuais: R$ 42,00", result["final_response"])
+        self.assertIn("Você prefere:", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
+        self.assertEqual(state.ultima_intencao, "fazer_pedido")
+
+    def test_cardapio_displays_feijao_and_pure_with_accents(self) -> None:
+        quarta = self.orchestrator.handle_message("quarta-feira", telefone="5511999990053")
+        sexta = self.orchestrator.handle_message("sexta-feira", telefone="5511999990054")
+
+        self.assertIn("Feijão tropeiro", quarta["final_response"])
+        self.assertIn("Purê de batata", sexta["final_response"])
+
+    def test_faz_entrega_still_returns_delivery_response(self) -> None:
+        result = self.orchestrator.handle_message("Faz entrega?", telefone="5511999990036")
+        self.assertIn("Fazemos entrega, sim", result["final_response"])
+
+    def test_location_question_returns_configuration_message(self) -> None:
+        result = self.orchestrator.handle_message("Onde fica?", telefone="5511999990037")
+        self.assertIn("ainda não foi configurado no sistema", result["final_response"])
+        self.assertNotIn("Como posso ajudar?", result["final_response"])
+
     def test_delivery_bairro_followup_gets_useful_response(self) -> None:
         first = self.orchestrator.handle_message("vcs entregam?", telefone="5511999990007")
         state_after_first = self._store["5511999990007"]
@@ -186,21 +333,22 @@ class CardapioDayContextTests(SimpleTestCase):
     def test_outside_hours_second_message_returns_short_message(self) -> None:
         self._configure_outside_hours()
         self.orchestrator.handle_message("oi", telefone="5511999990013")
-        result = self.orchestrator.handle_message("quero ver o cardápio", telefone="5511999990013")
+        result = self.orchestrator.handle_message("tem promoção?", telefone="5511999990013")
         self._assert_short_outside_hours_message(result["final_response"])
 
     def test_outside_hours_third_message_returns_short_message(self) -> None:
         self._configure_outside_hours()
         self.orchestrator.handle_message("oi", telefone="5511999990014")
-        self.orchestrator.handle_message("quero ver o cardápio", telefone="5511999990014")
+        self.orchestrator.handle_message("tem promoção?", telefone="5511999990014")
         result = self.orchestrator.handle_message("saber sobre valores", telefone="5511999990014")
         self._assert_short_outside_hours_message(result["final_response"])
 
     def test_outside_hours_human_request_returns_specific_message(self) -> None:
         self._configure_outside_hours()
-        result = self.orchestrator.handle_message("falar com atendente", telefone="5511999990015")
-        self.assertIn("No momento estamos fora do horário de atendimento.", result["final_response"])
-        self.assertIn("Deixe sua mensagem que a atendente responderá assim que possível.", result["final_response"])
+        result = self.orchestrator.handle_message("Ninguém para tirar dúvidas?", telefone="5511999990015")
+        self.assertIn("não há atendente disponível", result["final_response"])
+        self.assertIn("Horários:", result["final_response"])
+        self.assertIn("* Segunda-feira: 9h às 12h30", result["final_response"])
 
     def test_outside_hours_acknowledgement_returns_short_closing(self) -> None:
         self._configure_outside_hours()
@@ -215,15 +363,19 @@ class CardapioDayContextTests(SimpleTestCase):
         self._assert_full_outside_hours_message(result["final_response"])
         self.assertNotIn("Cardápios disponíveis:", result["final_response"])
 
-    def test_outside_hours_cardapio_question_returns_objective_message(self) -> None:
+    def test_outside_hours_cardapio_question_returns_cardapio_with_notice(self) -> None:
         self._configure_outside_hours()
         result = self.orchestrator.handle_message("qual o cardápio de segunda?", telefone="5511999990018")
-        self._assert_full_outside_hours_message(result["final_response"])
+        self.assertIn("O cardápio de segunda-feira é:", result["final_response"])
+        self.assertIn("Feijoada", result["final_response"])
+        self.assertIn("fora do horário de atendimento", result["final_response"])
 
-    def test_outside_hours_delivery_price_question_returns_objective_message(self) -> None:
+    def test_outside_hours_delivery_question_returns_contextual_message(self) -> None:
         self._configure_outside_hours()
-        result = self.orchestrator.handle_message("qual valor da entrega?", telefone="5511999990023")
-        self._assert_full_outside_hours_message(result["final_response"])
+        result = self.orchestrator.handle_message("Quero saber se fazem entrega", telefone="5511999990023")
+        self.assertIn("Fazemos entrega sim", result["final_response"])
+        self.assertIn("consultar taxa, região atendida e fazer seu pedido", result["final_response"])
+        self.assertIn("Horários de atendimento:", result["final_response"])
 
     def test_outside_hours_bairro_message_returns_objective_message(self) -> None:
         self._configure_outside_hours()
@@ -233,12 +385,20 @@ class CardapioDayContextTests(SimpleTestCase):
     def test_outside_hours_reservation_message_returns_objective_message(self) -> None:
         self._configure_outside_hours()
         result = self.orchestrator.handle_message("quero reservar", telefone="5511999990025")
-        self._assert_full_outside_hours_message(result["final_response"])
+        self.assertIn("fora do horário de atendimento para pedidos", result["final_response"])
+        self.assertIn("Horários de atendimento:", result["final_response"])
 
-    def test_outside_hours_order_message_returns_objective_message(self) -> None:
+    def test_outside_hours_order_message_returns_block_message(self) -> None:
         self._configure_outside_hours()
-        result = self.orchestrator.handle_message("quero 2 marmitex", telefone="5511999990026")
-        self._assert_full_outside_hours_message(result["final_response"])
+        result = self.orchestrator.handle_message("Quero pedir uma marmita", telefone="5511999990026")
+        self.assertIn("fora do horário de atendimento para pedidos", result["final_response"])
+        self.assertIn("Horários de atendimento:", result["final_response"])
+
+    def test_outside_hours_hours_question_returns_direct_schedule(self) -> None:
+        self._configure_outside_hours()
+        result = self.orchestrator.handle_message("Qual o horário de funcionamento?", telefone="5511999990038")
+        self.assertIn("Funcionamos nos seguintes horários:", result["final_response"])
+        self.assertIn("* Segunda-feira: 9h às 12h30", result["final_response"])
 
     def test_inside_hours_menu_option_two_still_opens_cardapio(self) -> None:
         result = self.orchestrator.handle_message("2", telefone="5511999990019")
@@ -247,6 +407,326 @@ class CardapioDayContextTests(SimpleTestCase):
     def test_inside_hours_order_message_still_starts_order(self) -> None:
         result = self.orchestrator.handle_message("quero 2 marmitex", telefone="5511999990020")
         self.assertIn("Seu pedido ficou assim", result["final_response"])
+
+    def test_order_quantity_message_preserves_additional_observation(self) -> None:
+        telefone = "5511999990027"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        result = self.orchestrator.handle_message(
+            "Uma só, porém quero acrescentar mais 1 bife",
+            telefone=telefone,
+        )
+        state = self._store[telefone]
+
+        self.assertIn("Seu pedido ficou assim", result["final_response"])
+        self.assertIn("* Observação: acrescentar mais 1 bife", result["final_response"])
+        self.assertIn("Total parcial: R$ 21,00", result["final_response"])
+        self.assertIn("esse adicional pode ter cobrança extra", result["final_response"])
+        self.assertEqual(state.itens_pedido[0]["observacao"], "acrescentar mais 1 bife")
+
+    def test_additional_request_without_open_order_starts_order_naturally(self) -> None:
+        result = self.orchestrator.handle_message("Pode acrescentar mais 1 bife?", telefone="5511999990028")
+
+        self.assertIn("Posso registrar essa observação no seu pedido.", result["final_response"])
+        self.assertIn("Você deseja:", result["final_response"])
+        self.assertIn("Marmitex Individual", result["final_response"])
+
+    def test_pickup_choice_after_five_minutes_keeps_order_context(self) -> None:
+        telefone = "5511999990029"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+
+        state_before = self._store[telefone]
+        self.assertEqual(state_before.status_atendimento, AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
+        self.assertEqual(state_before.aguardando_resposta, "tipo_entrega")
+
+        state_before.atualizado_em = datetime.utcnow() - timedelta(minutes=5)
+
+        result = self.orchestrator.handle_message("2", telefone=telefone)
+        state_after = self._store[telefone]
+
+        self.assertIn("retirada no local", result["final_response"].lower())
+        self.assertNotIn("Cardápios disponíveis:", result["final_response"])
+        self.assertNotIn("O cardápio", result["final_response"])
+        self.assertEqual(state_after.tipo_entrega, "retirada")
+        self.assertEqual(state_after.status_atendimento, AtendimentoStatus.AGUARDANDO_NOME_CLIENTE)
+        self.assertEqual(state_after.aguardando_resposta, "nome_cliente")
+
+    def test_pickup_flow_asks_name_before_payment(self) -> None:
+        telefone = "5511999990043"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Duas", telefone=telefone)
+        pickup = self.orchestrator.handle_message("2", telefone=telefone)
+        state_after_pickup = self._store[telefone]
+
+        self.assertIn("Qual nome devo colocar no pedido?", pickup["final_response"])
+        self.assertEqual(state_after_pickup.status_atendimento, AtendimentoStatus.AGUARDANDO_NOME_CLIENTE)
+
+        named = self.orchestrator.handle_message("André", telefone=telefone)
+        state_after_name = self._store[telefone]
+
+        self.assertIn("Obrigado, André", named["final_response"])
+        self.assertIn("Forma de recebimento: retirada no local", named["final_response"])
+        self.assertIn("Nome: André", named["final_response"])
+        self.assertIn("Total: R$ 42,00", named["final_response"])
+        self.assertIn("Qual será a forma de pagamento?", named["final_response"])
+        self.assertEqual(state_after_name.status_atendimento, AtendimentoStatus.AGUARDANDO_PAGAMENTO)
+        self.assertEqual(self._customer_names[telefone], "André")
+
+    def test_delivery_flow_asks_address_then_name_then_payment(self) -> None:
+        telefone = "5511999990044"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+        delivery = self.orchestrator.handle_message("1", telefone=telefone)
+        self.assertIn("Vou marcar como entrega", delivery["final_response"])
+        self.assertIn("endereço completo para entrega", delivery["final_response"])
+
+        named_prompt = self.orchestrator.handle_message("Rua Bahia 1000", telefone=telefone)
+        state_after_address = self._store[telefone]
+        self.assertIn("Qual nome devo colocar no pedido?", named_prompt["final_response"])
+        self.assertEqual(state_after_address.status_atendimento, AtendimentoStatus.AGUARDANDO_NOME_CLIENTE)
+
+        payment = self.orchestrator.handle_message("André", telefone=telefone)
+        self.assertIn("Obrigado, André", payment["final_response"])
+        self.assertIn("Forma de recebimento: entrega", payment["final_response"])
+        self.assertIn("Endereço: Rua Bahia 1000", payment["final_response"])
+        self.assertIn("Nome: André", payment["final_response"])
+        self.assertIn("Qual será a forma de pagamento?", payment["final_response"])
+
+    def test_new_order_keeps_previous_payment_proof_pending(self) -> None:
+        telefone = "5511999990045"
+        self._store[telefone] = self._FakeState(
+            telefone=telefone,
+            status_atendimento=AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO,
+            ultima_intencao="fazer_pedido",
+            itens_pedido=[{"produto": "marmitex individual", "quantidade": 1, "subtotal": 21.0}],
+            valor_total=21.0,
+            forma_pagamento="Pix",
+            aguardando_resposta="conferencia_pagamento",
+        )
+
+        result = self.orchestrator.handle_message("novo pedido", telefone=telefone)
+
+        self.assertIn("Certo 😊 Vou iniciar um novo pedido.", result["final_response"])
+        self.assertIn("continua aguardando conferência do comprovante pela equipe", result["final_response"])
+        self.assertNotIn("conferencia do comprovante", result["final_response"])
+
+    def test_invalid_state_with_pending_delivery_without_order_recovers_to_menu(self) -> None:
+        telefone = "5511999990046"
+        self._store[telefone] = self._FakeState(
+            telefone=telefone,
+            status_atendimento=AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA,
+            ultima_intencao="fazer_pedido",
+            aguardando_resposta="tipo_entrega",
+        )
+
+        result = self.orchestrator.handle_message("Oi", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Vamos recomeçar.", result["final_response"])
+        self.assertIn("1 - Fazer pedido", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.INICIO)
+        self.assertEqual(state.aguardando_resposta, "menu_principal")
+
+    def test_menu_during_valid_order_asks_before_abandoning_flow(self) -> None:
+        telefone = "5511999990047"
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+
+        result = self.orchestrator.handle_message("menu", telefone=telefone)
+
+        self.assertIn("Seu pedido ainda está em andamento", result["final_response"])
+        self.assertIn("digite reiniciar", result["final_response"])
+        self.assertIn("digite novo pedido", result["final_response"])
+
+    def test_reiniciar_clears_invalid_state_and_restarts_attendance(self) -> None:
+        telefone = "5511999990048"
+        self._store[telefone] = self._FakeState(
+            telefone=telefone,
+            status_atendimento=AtendimentoStatus.AGUARDANDO_COMPROVANTE,
+            ultima_intencao="fazer_pedido",
+            aguardando_resposta="comprovante",
+            forma_pagamento="",
+        )
+
+        result = self.orchestrator.handle_message("reiniciar", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Vamos recomeçar seu atendimento", result["final_response"])
+        self.assertIn("1 - Fazer pedido", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.INICIO)
+        self.assertEqual(state.aguardando_resposta, "menu_principal")
+
+    def test_three_greetings_in_trapped_state_still_return_recovery_response(self) -> None:
+        telefone = "5511999990049"
+        self._store[telefone] = self._FakeState(
+            telefone=telefone,
+            status_atendimento="status_quebrado",
+            ultima_intencao="fazer_pedido",
+            aguardando_resposta="campo_desconhecido",
+        )
+
+        responses = [
+            self.orchestrator.handle_message("Oi", telefone=telefone)["final_response"],
+            self.orchestrator.handle_message("Oi", telefone=telefone)["final_response"],
+            self.orchestrator.handle_message("Oi", telefone=telefone)["final_response"],
+        ]
+
+        self.assertTrue(any("Como posso ajudar?" in response for response in responses))
+        self.assertTrue(all(response.strip() for response in responses))
+
+    def test_service_returns_recovery_menu_when_orchestrator_raises_exception(self) -> None:
+        services_module.orchestrator_agent.handle_message = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        response = services_module.gerar_resposta_atendimento("Oi", telefone="5511999990050")
+
+        self.assertIn("Desculpe, tive uma dificuldade para continuar seu atendimento", response)
+        self.assertIn("1 - Fazer pedido", response)
+
+    def test_delivery_prompt_during_order_shows_only_today_hours(self) -> None:
+        telefone = "5511999990042"
+        original_localdate = orchestrator_module.timezone.localdate
+        orchestrator_module.timezone.localdate = lambda: date(2026, 6, 3)
+
+        try:
+            self.orchestrator.handle_message("1", telefone=telefone)
+            self.orchestrator.handle_message("1", telefone=telefone)
+            result = self.orchestrator.handle_message("Uma só", telefone=telefone)
+        finally:
+            orchestrator_module.timezone.localdate = original_localdate
+
+        self.assertIn("Você prefere:", result["final_response"])
+        self.assertIn("Hoje, quarta-feira, entregas e retiradas acontecem das 11h às 13h.", result["final_response"])
+        self.assertNotIn("segunda a sábado", result["final_response"])
+
+    def test_pix_payment_instructions_include_total_key_and_payee(self) -> None:
+        telefone = "5511999990039"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("André", telefone=telefone)
+        result = self.orchestrator.handle_message("1", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Pagamento via Pix", result["final_response"])
+        self.assertIn("Valor do pedido: R$ 21,00", result["final_response"])
+        self.assertIn("Chave Pix ainda não configurada no sistema.", result["final_response"])
+        self.assertIn("Favorecido:\nMarmitaria da Adriana", result["final_response"])
+        self.assertIn("envie o comprovante por aqui", result["final_response"])
+        self.assertNotIn("Se quiser cancelar", result["final_response"])
+        self.assertEqual(state.forma_pagamento, "Pix")
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.AGUARDANDO_COMPROVANTE)
+
+    def test_receipt_pending_ok_returns_short_response(self) -> None:
+        telefone = "5511999990040"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("André", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        result = self.orchestrator.handle_message("Ok", telefone=telefone)
+
+        self.assertIn("Fico aguardando o comprovante por aqui", result["final_response"])
+        self.assertNotIn("Se quiser cancelar", result["final_response"])
+        self.assertNotIn("Pagamento via Pix", result["final_response"])
+
+    def test_final_confirmation_accepts_pode_sim(self) -> None:
+        telefone = "5511999990056"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Duas", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("Andre", telefone=telefone)
+        self.orchestrator.handle_message("3", telefone=telefone)
+        result = self.orchestrator.handle_message("Pode sim", telefone=telefone)
+
+        self.assertIn("Pedido confirmado com sucesso", result["final_response"])
+        self.assertIn("Forma de pagamento: Cartão", result["final_response"])
+        self.assertIn("informe o nome Andre para retirar", result["final_response"])
+
+    def test_final_confirmation_accepts_pode(self) -> None:
+        telefone = "5511999990057"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Duas", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("Andre", telefone=telefone)
+        self.orchestrator.handle_message("3", telefone=telefone)
+        result = self.orchestrator.handle_message("Pode", telefone=telefone)
+
+        self.assertIn("Pedido confirmado com sucesso", result["final_response"])
+
+    def test_final_confirmation_accepts_ok(self) -> None:
+        telefone = "5511999990058"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Duas", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("Andre", telefone=telefone)
+        self.orchestrator.handle_message("3", telefone=telefone)
+        result = self.orchestrator.handle_message("Ok", telefone=telefone)
+
+        self.assertIn("Pedido confirmado com sucesso", result["final_response"])
+
+    def test_final_confirmation_accepts_confirmo(self) -> None:
+        telefone = "5511999990059"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Duas", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("Andre", telefone=telefone)
+        self.orchestrator.handle_message("3", telefone=telefone)
+        result = self.orchestrator.handle_message("Confirmo", telefone=telefone)
+
+        self.assertIn("Pedido confirmado com sucesso", result["final_response"])
+
+    def test_final_confirmation_cancel_clears_order(self) -> None:
+        telefone = "5511999990060"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Duas", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("Andre", telefone=telefone)
+        self.orchestrator.handle_message("3", telefone=telefone)
+        result = self.orchestrator.handle_message("Cancelar", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Pedido cancelado", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.INICIO)
+        self.assertEqual(state.itens_pedido, [])
+
+    def test_receipt_pending_cancel_clears_order_state(self) -> None:
+        telefone = "5511999990041"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("André", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        result = self.orchestrator.handle_message("Cancelar", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Pedido cancelado", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.INICIO)
+        self.assertEqual(state.itens_pedido, [])
+        self.assertEqual(state.forma_pagamento, "")
 
     def test_inside_hours_delivery_question_still_gets_delivery_response(self) -> None:
         result = self.orchestrator.handle_message("vcs entregam?", telefone="5511999990021")
@@ -267,6 +747,7 @@ class CardapioDayContextTests(SimpleTestCase):
             for key, value in fields.items():
                 if hasattr(state, key):
                     setattr(state, key, value)
+            state.atualizado_em = datetime.utcnow()
             return state
 
         def _reset_state(phone: str):
@@ -308,6 +789,19 @@ class CardapioDayContextTests(SimpleTestCase):
         order_module.get_order_product_choices = orchestrator_module.get_order_product_choices
         order_module.format_brl = orchestrator_module.format_brl
 
+        def _get_customer_name(_self, phone: str) -> str:
+            return self._customer_names.get(phone, "")
+
+        def _set_customer_name(_self, phone: str, name: str) -> str:
+            cleaned = " ".join(part.capitalize() for part in name.strip().split())
+            if not cleaned:
+                return ""
+            self._customer_names[phone] = cleaned
+            return cleaned
+
+        order_module.OrderAgent._get_customer_name = _get_customer_name
+        order_module.OrderAgent._set_customer_name = _set_customer_name
+
     def _configure_outside_hours(self) -> None:
         self.orchestrator._is_open_for_orders = lambda: False
         self.orchestrator._should_block_by_business_hours = (
@@ -328,7 +822,4 @@ class CardapioDayContextTests(SimpleTestCase):
 
     def _assert_short_outside_hours_message(self, response: str) -> None:
         self.assertIn("Ainda estamos fora do horário de atendimento 😊", response)
-        self.assertIn(
-            "Por favor, chame de segunda a sábado, das 9h às 12h30, para consultar cardápio, valores, entrega ou fazer pedidos.",
-            response,
-        )
+        self.assertIn("informações básicas, como horário, entrega, localização e cardápio", response)

@@ -59,7 +59,7 @@ class MessageAgent:
                 ),
             )
 
-        menu_option = self._extract_menu_option(message)
+        menu_option = self._extract_menu_option(message, state_summary=state_summary)
         if menu_option:
             return self._build_analysis(
                 message=message,
@@ -77,11 +77,66 @@ class MessageAgent:
             extraction = self._extract_with_rules(message, state_summary=state_summary)
         return self._build_analysis(message=message, menu_option="", extraction=extraction)
 
-    def _extract_menu_option(self, message: str) -> str:
-        normalized = message.strip().lower()
+    def _extract_menu_option(self, message: str, state_summary: dict | None = None) -> str:
+        normalized = self._normalize_menu_option_text(message)
         if normalized in {"1", "2", "3", "4"}:
+            if self._has_pending_order_step(state_summary):
+                return ""
             return normalized
         return ""
+
+    def _normalize_menu_option_text(self, text: str) -> str:
+        raw = (text or "").strip().lower()
+        if not raw:
+            return ""
+
+        # O WhatsApp pode entregar caracteres invisiveis ou pontuacao junto da opcao.
+        filtered = "".join(
+            ch for ch in unicodedata.normalize("NFKC", raw)
+            if unicodedata.category(ch) != "Cf"
+        )
+        return re.sub(r"^[^\w\d]+|[^\w\d]+$", "", filtered).strip()
+
+    def _has_pending_order_step(self, state_summary: dict | None) -> bool:
+        if not state_summary:
+            return False
+        pending_statuses = {
+            "fazendo_pedido",
+            "aguardando_tipo_entrega",
+            "aguardando_confirmacao_item",
+            "aguardando_produto",
+            "aguardando_pessoas_marmita",
+            "aguardando_quantidade",
+            "aguardando_endereco",
+            "aguardando_nome_cliente",
+            "aguardando_pagamento",
+            "aguardando_comprovante",
+            "aguardando_conferencia_pagamento",
+            "aguardando_confirmacao",
+            "aguardando_confirmacao_fazer_pedido",
+        }
+        pending_responses = {
+            "tipo_marmita",
+            "quantidade",
+            "tipo_entrega",
+            "endereco",
+            "nome_cliente",
+            "forma_pagamento",
+            "confirmacao",
+            "confirmacao_item",
+            "comprovante",
+            "conferencia_pagamento",
+            "pessoas_marmita",
+        }
+        pedido_atual = state_summary.get("pedido_atual") or {}
+        return bool(
+            state_summary.get("status_atendimento") in pending_statuses
+            or state_summary.get("aguardando_resposta") in pending_responses
+            or state_summary.get("ultima_intencao") == "fazer_pedido"
+            or pedido_atual.get("produto")
+            or pedido_atual.get("quantidade")
+            or pedido_atual.get("tipo_entrega")
+        )
 
     def _extract_menu_option_structured(self, menu_option: str) -> IntentExtractionResult:
         mapping = {
@@ -311,7 +366,7 @@ class MessageAgent:
         has_active_order_data = bool(
             state_summary.get("ultima_intencao") == "fazer_pedido"
             or state_summary.get("status_atendimento") not in {"", "inicio"}
-            or state_summary.get("aguardando_resposta") in {"quantidade", "tipo_entrega", "endereco", "forma_pagamento"}
+            or state_summary.get("aguardando_resposta") in {"quantidade", "tipo_entrega", "endereco", "nome_cliente", "forma_pagamento"}
             or pedido_atual.get("produto")
             or pedido_atual.get("quantidade")
             or pedido_atual.get("tipo_entrega")

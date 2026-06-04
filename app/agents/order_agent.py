@@ -2,6 +2,16 @@ import re
 import unicodedata
 from dataclasses import asdict
 
+from app.business_config import (
+    current_weekday_key,
+    delivery_hours_summary,
+    format_day_display,
+    format_time_br,
+    get_active_business_settings,
+    owner_consultation_message,
+    owner_consultation_threshold,
+    pickup_hours_summary,
+)
 from .conversation_state import AtendimentoStatus, get_or_create_state, reset_state, update_state
 from app.order_catalog import format_brl, get_order_product, get_order_product_by_people, get_order_product_choices, list_order_products
 from .payment_proof_agent import PaymentProofAgent
@@ -27,6 +37,310 @@ class OrderAgent:
 
     def __init__(self) -> None:
         self.payment_proof_agent = PaymentProofAgent()
+
+    def _business_settings(self):
+        return get_active_business_settings()
+
+    def _owner_threshold(self) -> int:
+        return owner_consultation_threshold(self._business_settings())
+
+    def _owner_consultation_message(self) -> str:
+        return owner_consultation_message(self._business_settings())
+
+    def _family_people_prompt(self) -> str:
+        threshold = min(self._owner_threshold(), 5)
+        if threshold < 2:
+            return self._owner_consultation_message()
+        options = ", ".join(str(item) for item in range(2, threshold + 1))
+        return f"Essa marmita é para quantas pessoas? Temos opções para {options} pessoas."
+
+    def _delivery_and_pickup_hours_text(self) -> str:
+        business = self._business_settings()
+        day_key = current_weekday_key()
+        day_label = format_day_display(day_key)
+        schedule = business.schedule_for_day(day_key)
+        if not schedule or schedule.fechado:
+            return f"Hoje, {day_label}, não temos atendimento para entregas e retiradas."
+
+        delivery_text = ""
+        pickup_text = ""
+        if business.aceita_entrega and schedule.abre_entregas and schedule.fecha_entregas:
+            delivery_text = f"das {format_time_br(schedule.abre_entregas)} às {format_time_br(schedule.fecha_entregas)}"
+        if business.aceita_retirada_local and schedule.abre_retiradas and schedule.fecha_retiradas:
+            pickup_text = f"das {format_time_br(schedule.abre_retiradas)} às {format_time_br(schedule.fecha_retiradas)}"
+
+        if delivery_text and pickup_text:
+            if delivery_text == pickup_text:
+                return f"Hoje, {day_label}, entregas e retiradas acontecem {delivery_text}."
+            return (
+                f"Hoje, {day_label}, entregas acontecem {delivery_text}. "
+                f"Retiradas acontecem {pickup_text}."
+            )
+        if delivery_text:
+            return f"Hoje, {day_label}, entregas acontecem {delivery_text}."
+        if pickup_text:
+            return f"Hoje, {day_label}, retiradas acontecem {pickup_text}."
+        return f"Hoje, {day_label}, entregas e retiradas estão indisponíveis."
+
+    def _delivery_mode_prompt(self) -> str:
+        business = self._business_settings()
+        if business.aceita_entrega and business.aceita_retirada_local:
+            return (
+                "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\n"
+                f"{self._delivery_and_pickup_hours_text()}"
+            )
+        if business.aceita_entrega:
+            return (
+                "No momento trabalhamos apenas com entrega.\n\n"
+                "1 - Entrega\n\n"
+                f"{self._delivery_and_pickup_hours_text()}"
+            )
+        if business.aceita_retirada_local:
+            return (
+                "No momento trabalhamos apenas com retirada no local.\n\n"
+                "2 - Retirada no local\n\n"
+                f"{self._delivery_and_pickup_hours_text()}"
+            )
+        return "No momento entrega e retirada estão indisponíveis. Fale com a atendente para seguir com o pedido."
+
+    def _payment_options_prompt(self) -> str:
+        return "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão"
+
+    def _pickup_confirmation_text(self) -> str:
+        business = self._business_settings()
+        location = business.endereco_retirada.strip()
+        if location:
+            return f"Perfeito 😊 Vou marcar como retirada no local em {location}."
+        return "Perfeito 😊 Vou marcar como retirada no local."
+
+    def _customer_name_prompt(self) -> str:
+        return "Qual nome devo colocar no pedido?"
+
+    def _invalid_customer_name_prompt(self) -> str:
+        return "Pode me informar o nome para identificar o pedido, por favor?"
+
+    def _delivery_address_prompt(self) -> str:
+        return "Por favor, informe o endereço completo para entrega."
+
+    def _get_customer_name(self, telefone: str) -> str:
+        try:
+            from app.models import Cliente
+
+            cliente = Cliente.objects.filter(telefone=telefone).only("nome").first()
+            return (cliente.nome or "").strip() if cliente else ""
+        except Exception:
+            return ""
+
+    def _set_customer_name(self, telefone: str, name: str) -> str:
+        cleaned = self._extract_customer_name(name)
+        if not cleaned:
+            return ""
+        try:
+            from app.models import Cliente
+
+            cliente, _ = Cliente.objects.get_or_create(telefone=telefone)
+            if cliente.nome != cleaned:
+                cliente.nome = cleaned
+                cliente.save(update_fields=["nome"])
+        except Exception:
+            pass
+        return cleaned
+
+    def _extract_customer_name(self, text: str) -> str:
+        original = re.sub(
+            r"^\s*(meu nome e|meu nome eh|meu nome é|nome|pode colocar|coloca|sou)\s+",
+            "",
+            (text or "").strip(),
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", original).strip(" .,:;-")
+        if not cleaned:
+            return ""
+        if not re.search(r"[A-Za-zÀ-ÿ]", cleaned):
+            return ""
+        if len(cleaned) > 80:
+            cleaned = cleaned[:80].rstrip()
+        return " ".join(part.capitalize() for part in cleaned.split())
+
+    def _payment_summary_response(self, state, customer_name: str) -> str:
+        total = format_brl(state.valor_total or 0)
+        lines = [f"Obrigado, {customer_name} 😊", "", "Resumo do pedido:", ""]
+        lines.extend(self._order_item_lines(state))
+        lines.append("")
+        lines.append(f"Forma de recebimento: {self._receiving_label(state)}")
+        if state.tipo_entrega == "entrega" and state.endereco:
+            lines.append(f"Endereço: {state.endereco}")
+        lines.append(f"Nome: {customer_name}")
+        lines.append(f"Total: {total}")
+        lines.extend(["", "Qual será a forma de pagamento?", "", "1 - Pix", "2 - Dinheiro", "3 - Cartão"])
+        return "\n".join(lines)
+
+    def _order_item_lines(self, state) -> list[str]:
+        if state.itens_pedido:
+            item_lines = []
+            for item in state.itens_pedido:
+                subtotal = f"R$ {float(item['subtotal']):.2f}".replace(".", ",")
+                qty = int(item["quantidade"])
+                produto = self._pluralize_produto(item["produto"], qty)
+                item_lines.append(f"* {qty} {produto}: {subtotal}")
+                observation = (item.get("observacao") or "").strip()
+                if observation:
+                    item_lines.append(f"* Observação: {observation}")
+            return item_lines
+
+        total = format_brl(state.valor_total or 0)
+        return [f"* {self._human_product_name(state.produto, state.quantidade)}: {total}"]
+
+    def _receiving_label(self, state) -> str:
+        if state.tipo_entrega == "retirada":
+            return "retirada no local"
+        if state.tipo_entrega == "entrega":
+            return "entrega"
+        return "não definido"
+
+    def _extract_order_observation(self, text: str) -> str:
+        original = (text or "").strip()
+        if not original:
+            return ""
+
+        patterns = [
+            r"\b(acrescent(?:ar|a|o)?\b.*)$",
+            r"\b(adicion(?:ar|a|e)?\b.*)$",
+            r"\b(colocar mais\b.*)$",
+            r"\b(extra\b.*)$",
+            r"\b(adicional\b.*)$",
+            r"\b(mais\s+\d+\s+[^\.,;!\?]+)$",
+            r"\b(mais\s+carne\b.*)$",
+            r"\b(sem\s+[^\.,;!\?]+)$",
+            r"\b(com\s+[^\.,;!\?]+)$",
+            r"\b(retirar\b.*)$",
+            r"\b(tirar\b.*)$",
+            r"\b(trocar\b.*)$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, original, flags=re.IGNORECASE)
+            if match:
+                observation = (match.group(1) or "").strip(" ,;:-")
+                return observation
+        return ""
+
+    def _is_possible_order_observation(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        if not normalized:
+            return False
+        if self._is_local_pickup(normalized) or self._looks_like_address(normalized):
+            return False
+        markers = [
+            "acrescent",
+            "adicion",
+            "colocar mais",
+            "extra",
+            "adicional",
+            "mais 1",
+            "mais carne",
+            "sem ",
+            "com ",
+            "retirar",
+            "tirar",
+            "trocar",
+        ]
+        return any(marker in normalized for marker in markers)
+
+    def _observation_may_have_extra_charge(self, observation: str) -> bool:
+        normalized = self._normalize(observation)
+        if not normalized:
+            return False
+        if normalized.startswith(("sem ", "retirar", "tirar", "trocar")):
+            return False
+        return any(
+            marker in normalized
+            for marker in [
+                "acrescent",
+                "adicion",
+                "colocar mais",
+                "extra",
+                "adicional",
+                "mais ",
+            ]
+        )
+
+    def _attach_observation_to_item(self, item: dict | None, observation: str) -> dict | None:
+        if item is None or not observation:
+            return item
+        item = item.copy()
+        existing = (item.get("observacao") or "").strip()
+        combined = observation.strip()
+        if existing and combined.lower() not in existing.lower():
+            combined = f"{existing}; {combined}"
+        elif existing:
+            combined = existing
+        item["observacao"] = combined
+        if self._observation_may_have_extra_charge(combined):
+            item["observacao_pode_ter_cobranca_extra"] = True
+        return item
+
+    def _items_have_pending_additional_review(self, items: list[dict]) -> bool:
+        return any(bool(item.get("observacao_pode_ter_cobranca_extra")) for item in items)
+
+    def _observation_review_prompt(self) -> str:
+        return (
+            "Só para confirmar: esse adicional pode ter cobrança extra. "
+            "Deseja que eu consulte a atendente ou posso continuar com o pedido?"
+        )
+
+    def _apply_observation_to_current_order(self, telefone: str, state, observation: str) -> dict | None:
+        if not observation or not state.itens_pedido:
+            return None
+
+        items = list(state.itens_pedido or [])
+        items[-1] = self._attach_observation_to_item(items[-1], observation)
+        has_pending_additional_review = self._items_have_pending_additional_review(items)
+
+        update_fields = {
+            "itens_pedido": items,
+        }
+        if has_pending_additional_review:
+            update_fields["status_atendimento"] = AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM
+            update_fields["aguardando_resposta"] = "confirmacao_item"
+        update_state(telefone, **update_fields)
+
+        refreshed = get_or_create_state(telefone)
+        pricing = {
+            "can_calculate": bool(refreshed.valor_total),
+            "needs_owner": False,
+            "unit_price": refreshed.valor_unitario,
+            "total_price": refreshed.valor_total,
+        }
+        if has_pending_additional_review:
+            response = self._build_items_summary_response(
+                items=refreshed.itens_pedido,
+                total=refreshed.valor_total,
+                ask_address=False,
+                show_partial_label=True,
+            )
+            response = f"{response}\n\n{self._observation_review_prompt()}"
+            return {
+                "state": asdict(refreshed),
+                "pricing": pricing,
+                "next_question": self._observation_review_prompt(),
+                "response": response,
+            }
+
+        next_question = self._next_question(refreshed, pricing)
+        current_state = get_or_create_state(telefone)
+        update_state(telefone, aguardando_resposta=self._awaiting_field(current_state, pricing))
+        response = self._build_items_summary_response(
+            items=current_state.itens_pedido,
+            total=current_state.valor_total,
+            ask_address=False,
+        )
+        response = f"{response}\n\n{next_question}"
+        return {
+            "state": asdict(get_or_create_state(telefone)),
+            "pricing": pricing,
+            "next_question": next_question,
+            "response": response,
+        }
 
     def process_message(
         self,
@@ -95,14 +409,29 @@ class OrderAgent:
             qty = self._to_int(normalized)
             if qty:
                 item = self._make_item("marmitex individual", "marmitex_individual", qty)
+                item = self._attach_observation_to_item(item, self._extract_order_observation(message))
                 if item is None:
                     return self._catalog_unavailable_response(telefone, "Marmitex individual")
                 return self._apply_order_items(telefone, [item])
 
+        if (
+            state.itens_pedido
+            and self._is_possible_order_observation(message)
+            and not self._extract_payment(text)
+            and not self._looks_like_address(text)
+        ):
+            observation_result = self._apply_observation_to_current_order(
+                telefone,
+                state,
+                self._extract_order_observation(message),
+            )
+            if observation_result is not None:
+                return observation_result
+
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA:
             people = self._extract_people_count_for_pending_family(normalized)
             if people:
-                if people > 5:
+                if people > self._owner_threshold():
                     update_state(
                         telefone,
                         status_atendimento=AtendimentoStatus.ENCAMINHAR_ATENDENTE,
@@ -116,8 +445,8 @@ class OrderAgent:
                             "unit_price": 0.0,
                             "total_price": 0.0,
                         },
-                        "next_question": "Para pedidos acima de 5 pessoas, preciso consultar a proprietária.",
-                        "response": "Para pedidos acima de 5 pessoas, preciso consultar a proprietária para confirmar o valor certinho.",
+                        "next_question": self._owner_consultation_message(),
+                        "response": self._owner_consultation_message(),
                     }
                 if people in {2, 3, 4, 5}:
                     pending_items = list(state.itens_pendentes or [])
@@ -138,8 +467,8 @@ class OrderAgent:
                     "unit_price": state.valor_unitario,
                     "total_price": state.valor_total,
                 },
-                "next_question": "Essa marmita é para quantas pessoas? Temos opções para 2, 3, 4 ou 5 pessoas.",
-                "response": "Essa marmita é para quantas pessoas? Temos opções para 2, 3, 4 ou 5 pessoas.",
+                "next_question": self._family_people_prompt(),
+                "response": self._family_people_prompt(),
             }
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PAGAMENTO:
@@ -164,6 +493,89 @@ class OrderAgent:
                     "next_question": next_question,
                     "response": response,
                 }
+
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_NOME_CLIENTE:
+            customer_name = self._set_customer_name(telefone, message)
+            if not customer_name:
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": self._invalid_customer_name_prompt(),
+                    "response": self._invalid_customer_name_prompt(),
+                }
+            update_state(
+                telefone,
+                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
+                aguardando_resposta="forma_pagamento",
+            )
+            refreshed = get_or_create_state(telefone)
+            return {
+                "state": asdict(refreshed),
+                "pricing": {
+                    "can_calculate": bool(refreshed.valor_total),
+                    "needs_owner": False,
+                    "unit_price": refreshed.valor_unitario,
+                    "total_price": refreshed.valor_total,
+                },
+                "next_question": self._payment_options_prompt(),
+                "response": self._payment_summary_response(refreshed, customer_name),
+            }
+
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO:
+            if self._is_cancel_request(normalized):
+                reset_state(telefone)
+                return {
+                    "state": asdict(get_or_create_state(telefone)),
+                    "pricing": {
+                        "can_calculate": False,
+                        "needs_owner": False,
+                        "unit_price": 0.0,
+                        "total_price": 0.0,
+                    },
+                    "next_question": "",
+                    "response": "Pedido cancelado. Se precisar de algo mais, é só me chamar.",
+                }
+            if self._is_final_order_change_request(message):
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": "Sem problema 😊 O que você deseja alterar: itens, entrega/retirada, endereço, nome ou pagamento?",
+                    "response": "Sem problema 😊 O que você deseja alterar: itens, entrega/retirada, endereço, nome ou pagamento?",
+                }
+            if self._is_final_order_confirmation(message):
+                refreshed = get_or_create_state(telefone)
+                return {
+                    "state": asdict(refreshed),
+                    "pricing": {
+                        "can_calculate": bool(refreshed.valor_total),
+                        "needs_owner": False,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": refreshed.valor_total,
+                    },
+                    "next_question": "",
+                    "response": self._build_confirmed_order_response(refreshed),
+                }
+            return {
+                "state": asdict(state),
+                "pricing": {
+                    "can_calculate": bool(state.valor_total),
+                    "needs_owner": False,
+                    "unit_price": state.valor_unitario,
+                    "total_price": state.valor_total,
+                },
+                "next_question": "Posso seguir com esse pedido? Se estiver tudo certo, me confirme por favor.",
+                "response": self._build_order_summary(state),
+            }
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA:
             if self._is_cancel_request(normalized):
@@ -203,10 +615,10 @@ class OrderAgent:
                         "unit_price": refreshed.valor_unitario,
                         "total_price": round(sum(item["subtotal"] for item in refreshed.itens_pendentes), 2),
                     },
-                    "next_question": "Essa marmita é para quantas pessoas? Temos opções para 2, 3, 4 ou 5 pessoas.",
+                    "next_question": self._family_people_prompt(),
                     "response": (
                         f"{partial}\n\n" if partial else ""
-                    ) + "Essa marmita é para quantas pessoas? Temos opções para 2, 3, 4 ou 5 pessoas.",
+                    ) + self._family_people_prompt(),
                 }
 
             if self._is_delivery_fee_question(normalized):
@@ -219,17 +631,27 @@ class OrderAgent:
                         "total_price": state.valor_total,
                     },
                     "next_question": (
-                        "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\n"
-                        "Entregas e retiradas acontecem das 11h às 13h."
+                        self._delivery_mode_prompt()
                     ),
                     "response": (
                         "A taxa de entrega depende do endereço. "
                         "Se você escolher entrega, me envie o endereço para confirmarmos certinho.\n\n"
-                        "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\n"
-                        "Entregas e retiradas acontecem das 11h às 13h."
+                        f"{self._delivery_mode_prompt()}"
                     ),
                 }
             if self._is_delivery_choice(normalized):
+                if not self._business_settings().aceita_entrega:
+                    return {
+                        "state": asdict(state),
+                        "pricing": {
+                            "can_calculate": bool(state.valor_total),
+                            "needs_owner": False,
+                            "unit_price": state.valor_unitario,
+                            "total_price": state.valor_total,
+                        },
+                        "next_question": self._delivery_mode_prompt(),
+                        "response": f"Entrega indisponível no momento.\n\n{self._delivery_mode_prompt()}",
+                    }
                 update_state(
                     telefone,
                     tipo_entrega="entrega",
@@ -245,16 +667,34 @@ class OrderAgent:
                         "unit_price": refreshed.valor_unitario,
                         "total_price": refreshed.valor_total,
                     },
-                    "next_question": "Perfeito 😊 Me informe o endereço de entrega, por favor.",
-                    "response": "Perfeito 😊 Me informe o endereço de entrega, por favor.",
+                    "next_question": (
+                        "Perfeito 😊 Vou marcar como entrega.\n\n"
+                        f"{self._delivery_address_prompt()}"
+                    ),
+                    "response": (
+                        "Perfeito 😊 Vou marcar como entrega.\n\n"
+                        f"{self._delivery_address_prompt()}"
+                    ),
                 }
             if self._is_pickup_choice(normalized):
+                if not self._business_settings().aceita_retirada_local:
+                    return {
+                        "state": asdict(state),
+                        "pricing": {
+                            "can_calculate": bool(state.valor_total),
+                            "needs_owner": False,
+                            "unit_price": state.valor_unitario,
+                            "total_price": state.valor_total,
+                        },
+                        "next_question": self._delivery_mode_prompt(),
+                        "response": f"Retirada no local indisponível no momento.\n\n{self._delivery_mode_prompt()}",
+                    }
                 update_state(
                     telefone,
                     tipo_entrega="retirada",
                     endereco="retirada no local",
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                    aguardando_resposta="forma_pagamento",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                    aguardando_resposta="nome_cliente",
                 )
                 refreshed = get_or_create_state(telefone)
                 return {
@@ -265,11 +705,10 @@ class OrderAgent:
                         "unit_price": refreshed.valor_unitario,
                         "total_price": refreshed.valor_total,
                     },
-                    "next_question": "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão",
+                    "next_question": self._customer_name_prompt(),
                     "response": (
-                        "Perfeito 😊 Vou marcar como retirada no local.\n\n"
-                        "Qual será a forma de pagamento?\n"
-                        "1 - Pix\n2 - Dinheiro\n3 - Cartão"
+                        f"{self._pickup_confirmation_text()}\n\n"
+                        f"{self._customer_name_prompt()}"
                     ),
                 }
             if self._looks_like_address(text):
@@ -277,8 +716,8 @@ class OrderAgent:
                     telefone,
                     tipo_entrega="entrega",
                     endereco=message.strip(),
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                    aguardando_resposta="forma_pagamento",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                    aguardando_resposta="nome_cliente",
                 )
                 refreshed = get_or_create_state(telefone)
                 return {
@@ -289,8 +728,8 @@ class OrderAgent:
                         "unit_price": refreshed.valor_unitario,
                         "total_price": refreshed.valor_total,
                     },
-                    "next_question": "Qual será a forma de pagamento? Pix, dinheiro ou cartão?",
-                    "response": "Perfeito 😊 Endereço anotado. Qual será a forma de pagamento? Pix, dinheiro ou cartão?",
+                    "next_question": self._customer_name_prompt(),
+                    "response": f"Perfeito 😊 Endereço anotado. {self._customer_name_prompt()}",
                 }
             return {
                 "state": asdict(state),
@@ -300,13 +739,8 @@ class OrderAgent:
                     "unit_price": state.valor_unitario,
                     "total_price": state.valor_total,
                 },
-                "next_question": "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\nEntregas e retiradas acontecem das 11h às 13h.",
-                "response": (
-                    "Você prefere:\n\n"
-                    "1 - Entrega\n"
-                    "2 - Retirada no local\n\n"
-                    "Entregas e retiradas acontecem das 11h às 13h."
-                ),
+                "next_question": self._delivery_mode_prompt(),
+                "response": self._delivery_mode_prompt(),
             }
 
         if self._is_delivery_fee_question(normalized):
@@ -352,8 +786,8 @@ class OrderAgent:
                 telefone,
                 tipo_entrega="retirada",
                 endereco="retirada no local",
-                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                aguardando_resposta="forma_pagamento",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                aguardando_resposta="nome_cliente",
                 ultima_intencao="fazer_pedido",
             )
             refreshed = get_or_create_state(telefone)
@@ -365,26 +799,24 @@ class OrderAgent:
                     "unit_price": refreshed.valor_unitario,
                     "total_price": refreshed.valor_total,
                 },
-                "next_question": "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão",
+                "next_question": self._customer_name_prompt(),
                 "response": (
-                    "Perfeito 😊 Vou marcar como retirada no local.\n\n"
-                    "Qual será a forma de pagamento?\n"
-                    "1 - Pix\n2 - Dinheiro\n3 - Cartão"
+                    f"{self._pickup_confirmation_text()}\n\n"
+                    f"{self._customer_name_prompt()}"
                 ),
             }
 
         if self._is_total_question(text) and state.produto and state.quantidade and state.valor_total > 0:
             waiting_status = AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA
             waiting_question = (
-                "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\n"
-                "Entregas e retiradas acontecem das 11h às 13h."
+                self._delivery_mode_prompt()
             )
             if state.tipo_entrega == "entrega":
                 waiting_status = AtendimentoStatus.AGUARDANDO_ENDERECO
-                waiting_question = "Pode me informar o endereço de entrega, por favor?"
+                waiting_question = self._delivery_address_prompt()
             elif state.tipo_entrega == "retirada":
-                waiting_status = AtendimentoStatus.AGUARDANDO_PAGAMENTO
-                waiting_question = "Qual será a forma de pagamento? Pix, dinheiro ou cartão?"
+                waiting_status = AtendimentoStatus.AGUARDANDO_NOME_CLIENTE
+                waiting_question = self._customer_name_prompt()
             update_state(telefone, status_atendimento=waiting_status)
             refreshed = get_or_create_state(telefone)
             total = f"R$ {refreshed.valor_total:.2f}".replace(".", ",")
@@ -421,13 +853,9 @@ class OrderAgent:
                     "total_price": 0.0,
                 },
                 "next_question": (
-                    "Para pedidos acima de 5 pessoas, preciso consultar a proprietária "
-                    "do estabelecimento para confirmar o valor certinho."
+                    self._owner_consultation_message()
                 ),
-                "response": (
-                    "Para pedidos acima de 5 pessoas, preciso consultar a proprietária "
-                    "do estabelecimento para confirmar o valor certinho."
-                ),
+                "response": self._owner_consultation_message(),
             }
 
         if items_data["incomplete_family"]:
@@ -449,10 +877,10 @@ class OrderAgent:
                     "unit_price": refreshed.valor_unitario,
                     "total_price": round(sum(item["subtotal"] for item in refreshed.itens_pendentes), 2),
                 },
-                "next_question": "Essa marmita é para quantas pessoas? Temos opções para 2, 3, 4 ou 5 pessoas.",
+                "next_question": self._family_people_prompt(),
                 "response": (
                     f"{partial}\n\n" if partial else ""
-                ) + "Essa marmita é para quantas pessoas? Temos opções para 2, 3, 4 ou 5 pessoas.",
+                ) + self._family_people_prompt(),
             }
 
         if items_data["items"]:
@@ -460,28 +888,21 @@ class OrderAgent:
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM:
             if self._is_positive_confirmation(text):
-                update_state(
-                    telefone,
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_ENDERECO,
-                    aguardando_resposta="endereco",
-                )
                 refreshed = get_or_create_state(telefone)
-                total = f"R$ {refreshed.valor_total:.2f}".replace(".", ",")
-                produto = self._human_product_name(refreshed.produto, refreshed.quantidade)
+                pricing = {
+                    "can_calculate": bool(refreshed.valor_total),
+                    "needs_owner": False,
+                    "unit_price": refreshed.valor_unitario,
+                    "total_price": refreshed.valor_total,
+                }
+                next_question = self._next_question(refreshed, pricing)
+                current_state = get_or_create_state(telefone)
+                update_state(telefone, aguardando_resposta=self._awaiting_field(current_state, pricing))
                 return {
-                    "state": asdict(refreshed),
-                    "pricing": {
-                        "can_calculate": True,
-                        "needs_owner": False,
-                        "unit_price": refreshed.valor_unitario,
-                        "total_price": refreshed.valor_total,
-                    },
-                    "next_question": "Pode me informar o endereço de entrega, por favor?",
-                    "response": (
-                        "Perfeito 😊\n\n"
-                        f"Entao ficou:\n{produto}\nTotal: {total}\n\n"
-                        "Agora me informe o endereço de entrega, por favor."
-                    ),
+                    "state": asdict(get_or_create_state(telefone)),
+                    "pricing": pricing,
+                    "next_question": next_question,
+                    "response": next_question,
                 }
             return {
                 "state": asdict(state),
@@ -491,11 +912,23 @@ class OrderAgent:
                     "unit_price": state.valor_unitario,
                     "total_price": state.valor_total,
                 },
-                "next_question": "Você confirma esse item para eu continuar o pedido?",
-                "response": "Você confirma esse item para eu continuar o pedido?",
+                "next_question": self._observation_review_prompt(),
+                "response": self._observation_review_prompt(),
             }
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_COMPROVANTE:
+            if self._is_receipt_pending_acknowledgement(text) and not file_name and not file_mimetype:
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": "Envie o comprovante por imagem, PDF ou texto do comprovante.",
+                    "response": "Tudo bem 😊 Fico aguardando o comprovante por aqui.",
+                }
             proof_analysis = self.payment_proof_agent.analyze(
                 text=text,
                 file_name=file_name,
@@ -649,17 +1082,30 @@ class OrderAgent:
                 }
             current_key = state.produto or "marmitex_individual"
             item = self._make_item_from_key(current_key, parsed_qty)
+            item = self._attach_observation_to_item(item, self._extract_order_observation(message))
             if item is None:
                 return self._catalog_unavailable_response(telefone, "item selecionado")
             return self._apply_order_items(telefone, [item])
 
         if intencao == "informar_retirada" and in_order:
+            if not self._business_settings().aceita_retirada_local:
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": self._delivery_mode_prompt(),
+                    "response": f"Retirada no local indisponível no momento.\n\n{self._delivery_mode_prompt()}",
+                }
             update_state(
                 telefone,
                 tipo_entrega="retirada",
                 endereco="retirada no local",
-                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                aguardando_resposta="forma_pagamento",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                aguardando_resposta="nome_cliente",
                 ultima_intencao="fazer_pedido",
             )
             refreshed = get_or_create_state(telefone)
@@ -671,11 +1117,10 @@ class OrderAgent:
                     "unit_price": refreshed.valor_unitario,
                     "total_price": refreshed.valor_total,
                 },
-                "next_question": "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão",
+                "next_question": self._customer_name_prompt(),
                 "response": (
-                    "Perfeito 😊 Vou marcar como retirada no local.\n\n"
-                    "Qual será a forma de pagamento?\n"
-                    "1 - Pix\n2 - Dinheiro\n3 - Cartão"
+                    f"{self._pickup_confirmation_text()}\n\n"
+                    f"{self._customer_name_prompt()}"
                 ),
             }
         if intencao == "informar_retirada" and not in_order and "marmita" in self._normalize(message):
@@ -704,6 +1149,18 @@ class OrderAgent:
             }
 
         if intencao in {"informar_endereco", "informar_entrega"} and in_order:
+            if not self._business_settings().aceita_entrega:
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": self._delivery_mode_prompt(),
+                    "response": f"Entrega indisponível no momento.\n\n{self._delivery_mode_prompt()}",
+                }
             if tipo_entrega == "entrega" and not endereco:
                 update_state(
                     telefone,
@@ -721,16 +1178,16 @@ class OrderAgent:
                         "unit_price": refreshed.valor_unitario,
                         "total_price": refreshed.valor_total,
                     },
-                    "next_question": "Pode me informar o endereço de entrega, por favor?",
-                    "response": "Pode me informar o endereço de entrega, por favor?",
+                    "next_question": self._delivery_address_prompt(),
+                    "response": self._delivery_address_prompt(),
                 }
             if endereco:
                 update_state(
                     telefone,
                     tipo_entrega="entrega",
                     endereco=endereco,
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                    aguardando_resposta="forma_pagamento",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                    aguardando_resposta="nome_cliente",
                     ultima_intencao="fazer_pedido",
                 )
                 refreshed = get_or_create_state(telefone)
@@ -742,8 +1199,8 @@ class OrderAgent:
                         "unit_price": refreshed.valor_unitario,
                         "total_price": refreshed.valor_total,
                     },
-                    "next_question": "Qual será a forma de pagamento? Pix, dinheiro ou cartão?",
-                    "response": "Perfeito 😊 Endereço anotado. Qual será a forma de pagamento? Pix, dinheiro ou cartão?",
+                    "next_question": self._customer_name_prompt(),
+                    "response": f"Perfeito 😊 Endereço anotado. {self._customer_name_prompt()}",
                 }
 
         if intencao != "fazer_pedido":
@@ -799,7 +1256,7 @@ class OrderAgent:
 
         if produto_key.startswith("marmita_") and produto_key.endswith("_pessoas"):
             people = self._extract_people_from_key(produto_key)
-            if people and people > 5:
+            if people and people > self._owner_threshold():
                 return None
 
         qty = resolved_qty or 1
@@ -813,6 +1270,7 @@ class OrderAgent:
             ):
                 qty = 1
         item = self._make_item_from_key(produto_key, qty)
+        item = self._attach_observation_to_item(item, self._extract_order_observation(message))
         if item is None:
             human_name = "marmita selecionada" if produto_key != "marmitex_individual" else "marmitex individual"
             return self._catalog_unavailable_response(telefone, human_name)
@@ -823,22 +1281,22 @@ class OrderAgent:
                 telefone,
                 tipo_entrega="retirada",
                 endereco="retirada no local",
-                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                aguardando_resposta="forma_pagamento",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                aguardando_resposta="nome_cliente",
             )
             refreshed = get_or_create_state(telefone)
             result["state"] = asdict(refreshed)
             result["pricing"]["unit_price"] = refreshed.valor_unitario
             result["pricing"]["total_price"] = refreshed.valor_total
-            result["next_question"] = "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão"
+            result["next_question"] = self._customer_name_prompt()
             result["response"] = (
                 self._build_items_summary_response(
                     items=refreshed.itens_pedido,
                     total=refreshed.valor_total,
                     ask_address=False,
                 )
-                + "\n\nPerfeito 😊 Vou marcar como retirada no local.\n\n"
-                + "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão"
+                + f"\n\n{self._pickup_confirmation_text()}\n\n"
+                + self._customer_name_prompt()
             )
         elif tipo_entrega == "entrega":
             if endereco:
@@ -846,21 +1304,21 @@ class OrderAgent:
                     telefone,
                     tipo_entrega="entrega",
                     endereco=endereco,
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                    aguardando_resposta="forma_pagamento",
+                    status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                    aguardando_resposta="nome_cliente",
                 )
                 refreshed = get_or_create_state(telefone)
                 result["state"] = asdict(refreshed)
                 result["pricing"]["unit_price"] = refreshed.valor_unitario
                 result["pricing"]["total_price"] = refreshed.valor_total
-                result["next_question"] = "Qual será a forma de pagamento? Pix, dinheiro ou cartão?"
+                result["next_question"] = self._customer_name_prompt()
                 result["response"] = (
                     self._build_items_summary_response(
                         items=refreshed.itens_pedido,
                         total=refreshed.valor_total,
                         ask_address=False,
                     )
-                    + "\n\nPerfeito 😊 Endereço anotado. Qual será a forma de pagamento? Pix, dinheiro ou cartão?"
+                    + f"\n\nPerfeito 😊 Endereço anotado. {self._customer_name_prompt()}"
                 )
             else:
                 update_state(
@@ -873,14 +1331,18 @@ class OrderAgent:
                 result["state"] = asdict(refreshed)
                 result["pricing"]["unit_price"] = refreshed.valor_unitario
                 result["pricing"]["total_price"] = refreshed.valor_total
-                result["next_question"] = "Perfeito 😊 Me informe o endereço de entrega, por favor."
+                result["next_question"] = (
+                    "Perfeito 😊 Vou marcar como entrega.\n\n"
+                    f"{self._delivery_address_prompt()}"
+                )
                 result["response"] = (
                     self._build_items_summary_response(
                         items=refreshed.itens_pedido,
                         total=refreshed.valor_total,
                         ask_address=False,
                     )
-                    + "\n\nPerfeito 😊 Me informe o endereço de entrega, por favor."
+                    + "\n\nPerfeito 😊 Vou marcar como entrega.\n\n"
+                    + self._delivery_address_prompt()
                 )
         return result
 
@@ -951,22 +1413,22 @@ class OrderAgent:
             update_state(
                 telefone,
                 endereco="retirada no local",
-                status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO,
-                aguardando_resposta="forma_pagamento",
+                status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
+                aguardando_resposta="nome_cliente",
             )
             current = get_or_create_state(telefone)
             result["state"] = asdict(current)
             result["pricing"]["unit_price"] = current.valor_unitario
             result["pricing"]["total_price"] = current.valor_total
-            result["next_question"] = "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão"
+            result["next_question"] = self._customer_name_prompt()
             result["response"] = (
                 self._build_items_summary_response(
                     items=current.itens_pedido,
                     total=current.valor_total,
                     ask_address=False,
                 )
-                + "\n\nPerfeito 😊 Vou marcar como retirada no local.\n\n"
-                + "Qual será a forma de pagamento?\n1 - Pix\n2 - Dinheiro\n3 - Cartão"
+                + f"\n\n{self._pickup_confirmation_text()}\n\n"
+                + self._customer_name_prompt()
             )
             return result
 
@@ -980,14 +1442,18 @@ class OrderAgent:
             result["state"] = asdict(current)
             result["pricing"]["unit_price"] = current.valor_unitario
             result["pricing"]["total_price"] = current.valor_total
-            result["next_question"] = "Perfeito 😊 Me informe o endereço de entrega, por favor."
+            result["next_question"] = (
+                "Perfeito 😊 Vou marcar como entrega.\n\n"
+                f"{self._delivery_address_prompt()}"
+            )
             result["response"] = (
                 self._build_items_summary_response(
                     items=current.itens_pedido,
                     total=current.valor_total,
                     ask_address=False,
                 )
-                + "\n\nPerfeito 😊 Me informe o endereço de entrega, por favor."
+                + "\n\nPerfeito 😊 Vou marcar como entrega.\n\n"
+                + self._delivery_address_prompt()
             )
         return result
 
@@ -1027,11 +1493,29 @@ class OrderAgent:
                     "unit_price": float(selected_choice["preco"]),
                     "total_price": 0.0,
                 },
-                "next_question": "Quantas marmitex individuais voce deseja?",
-                "response": "Perfeito 😊 Quantas marmitex individuais voce deseja?",
+                "next_question": "Quantas marmitex individuais você deseja?",
+                "response": "Perfeito 😊 Quantas marmitex individuais você deseja?",
             }
 
         people = int(selected_choice["people_count"])
+        if people > self._owner_threshold():
+            update_state(
+                telefone,
+                ultima_intencao="fazer_pedido",
+                status_atendimento=AtendimentoStatus.ENCAMINHAR_ATENDENTE,
+                aguardando_resposta="consulta_proprietaria",
+            )
+            return {
+                "state": asdict(get_or_create_state(telefone)),
+                "pricing": {
+                    "can_calculate": False,
+                    "needs_owner": True,
+                    "unit_price": 0.0,
+                    "total_price": 0.0,
+                },
+                "next_question": self._owner_consultation_message(),
+                "response": self._owner_consultation_message(),
+            }
         item = self._make_item(
             produto=f"marmita para {people} pessoas",
             produto_key=f"marmita_{people}_pessoas",
@@ -1060,24 +1544,32 @@ class OrderAgent:
         pending_fields = {}
         if clear_pending:
             pending_fields = {"itens_pendentes": []}
+        has_pending_additional_review = self._items_have_pending_additional_review(items)
         update_state(
             telefone,
             ultima_intencao="fazer_pedido",
-            status_atendimento=AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA,
+            status_atendimento=(
+                AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM
+                if has_pending_additional_review
+                else AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA
+            ),
             itens_pedido=items,
             produto=first["produto_key"],
             quantidade=first["quantidade"],
             valor_unitario=first["valor_unitario"],
             valor_total=total_price,
-            aguardando_resposta="tipo_entrega",
+            aguardando_resposta="confirmacao_item" if has_pending_additional_review else "tipo_entrega",
             **pending_fields,
         )
         refreshed = get_or_create_state(telefone)
         response = self._build_items_summary_response(
             items=refreshed.itens_pedido,
             total=refreshed.valor_total,
-            ask_address=not bool(refreshed.tipo_entrega),
+            ask_address=not bool(refreshed.tipo_entrega) and not has_pending_additional_review,
+            show_partial_label=has_pending_additional_review,
         )
+        if has_pending_additional_review:
+            response = f"{response}\n\n{self._observation_review_prompt()}"
         return {
             "state": asdict(refreshed),
             "pricing": {
@@ -1086,10 +1578,7 @@ class OrderAgent:
                 "unit_price": refreshed.valor_unitario,
                 "total_price": refreshed.valor_total,
             },
-            "next_question": (
-                "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\n"
-                "Entregas e retiradas acontecem das 11h às 13h."
-            ),
+            "next_question": self._observation_review_prompt() if has_pending_additional_review else self._delivery_mode_prompt(),
             "response": response,
         }
 
@@ -1155,6 +1644,75 @@ class OrderAgent:
             return True
         return False
 
+    def _is_final_order_confirmation(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        if not normalized:
+            return False
+        return normalized in {
+            "sim",
+            "pode",
+            "pode sim",
+            "ok",
+            "okay",
+            "certo",
+            "confirmo",
+            "confirmar",
+            "esta certo",
+            "ta certo",
+            "isso",
+            "isso mesmo",
+            "pode seguir",
+            "fechado",
+            "beleza",
+        }
+
+    def _is_final_order_change_request(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        if not normalized:
+            return False
+        return normalized in {
+            "nao",
+            "não",
+            "quero alterar",
+            "alterar",
+            "mudar",
+            "corrigir",
+        }
+
+    def _is_receipt_pending_acknowledgement(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        if not normalized:
+            return False
+        return normalized in {
+            "ok",
+            "okay",
+            "certo",
+            "ta bom",
+            "tá bom",
+            "beleza",
+            "vou enviar",
+            "vou mandar",
+            "ja mando",
+            "ja envio",
+            "envio ja",
+        }
+
+    def _pix_payment_instructions(self, state) -> str:
+        business = self._business_settings()
+        total = format_brl(state.valor_total or 0)
+        pix_key = (business.chave_pix or "").strip() or "Chave Pix ainda não configurada no sistema."
+        payee = (business.nome_empresa or "").strip() or "Marmitaria da Adriana"
+        if payee == "Marmitaria Adriana":
+            payee = "Marmitaria da Adriana"
+
+        return (
+            "Perfeito 😊 Pagamento via Pix.\n\n"
+            f"Valor do pedido: {total}\n\n"
+            f"Chave Pix:\n{pix_key}\n\n"
+            f"Favorecido:\n{payee}\n\n"
+            "Depois de fazer o Pix, envie o comprovante por aqui para conferirmos o pagamento."
+        )
+
     def _normalize(self, text: str) -> str:
         raw = (text or "").strip().lower().replace("9", "o")
         raw = "".join(ch for ch in unicodedata.normalize("NFD", raw) if unicodedata.category(ch) != "Mn")
@@ -1174,7 +1732,9 @@ class OrderAgent:
         if "marmita" in text and m_people:
             people = int(m_people.group(1))
             quantity = people
-            if people == 2:
+            if people > self._owner_threshold():
+                product = "marmita_acima_5_pessoas"
+            elif people == 2:
                 product = "marmita_2_pessoas"
             elif people == 3:
                 product = "marmita_3_pessoas"
@@ -1235,7 +1795,7 @@ class OrderAgent:
             order_qty = self._to_int(m.group("qty") or "1") or 1
             people = self._to_int(m.group("people")) or 0
 
-            if people > 5:
+            if people > self._owner_threshold():
                 needs_owner = True
                 continue
             catalog_item = get_order_product_by_people(people, only_available=True)
@@ -1298,8 +1858,13 @@ class OrderAgent:
                     grouped[key]["quantidade"] * grouped[key]["valor_unitario"], 2
                 )
 
+        observation = self._extract_order_observation(text)
+        grouped_items = list(grouped.values())
+        if observation and len(grouped_items) == 1:
+            grouped_items[0] = self._attach_observation_to_item(grouped_items[0], observation)
+
         return {
-            "items": list(grouped.values()),
+            "items": grouped_items,
             "needs_owner": needs_owner,
             "incomplete_family": bool(incomplete_family_spans),
             "incomplete_family_quantity": incomplete_family_quantity or 1,
@@ -1338,7 +1903,14 @@ class OrderAgent:
         t = self._normalize(token)
         if t.isdigit():
             return int(t)
-        return NUMBER_WORDS.get(t)
+        if t in NUMBER_WORDS:
+            return NUMBER_WORDS[t]
+        for part in t.split():
+            if part.isdigit():
+                return int(part)
+            if part in NUMBER_WORDS:
+                return NUMBER_WORDS[part]
+        return None
 
     def _extract_payment(self, text: str) -> str:
         normalized = self._normalize(text)
@@ -1409,7 +1981,7 @@ class OrderAgent:
                 lines = ["Nossos valores sao:\n"]
                 for product in available_products:
                     lines.append(f"* {product['nome']}: {format_brl(product['preco'])}")
-                lines.append("\nPara pedidos acima de 5 pessoas, preciso consultar a proprietária.")
+                lines.append(f"\n{self._owner_consultation_message()}")
             else:
                 lines = ["No momento não há opções de pedido disponíveis no catálogo."]
 
@@ -1453,7 +2025,11 @@ class OrderAgent:
         return any(k in text for k in ["rua", "av", "avenida", "travessa", "bairro", "numero", "nº", "cep"])
 
     def _product_selection_prompt(self) -> str:
-        choices = get_order_product_choices()
+        choices = [
+            item
+            for item in get_order_product_choices()
+            if item["key"] == "marmitex_individual" or item["people_count"] <= self._owner_threshold()
+        ]
         if not choices:
             return (
                 "No momento não há produtos de pedido disponíveis no catálogo. "
@@ -1543,6 +2119,8 @@ class OrderAgent:
             return "tipo_entrega"
         if state.tipo_entrega != "retirada" and not state.endereco:
             return "endereco"
+        if not self._get_customer_name(state.telefone):
+            return "nome_cliente"
         if not state.forma_pagamento:
             return "forma_pagamento"
         if state.forma_pagamento == "Pix":
@@ -1559,22 +2137,22 @@ class OrderAgent:
             return "Qual a quantidade desejada?"
         if waiting == "consulta_proprietaria":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.ENCAMINHAR_ATENDENTE)
-            return (
-                "Para pedidos acima de 5 pessoas, preciso consultar a proprietária "
-                "do estabelecimento para confirmar o valor certinho."
-            )
+            return self._owner_consultation_message()
         if waiting == "tipo_entrega":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
-            return "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\nEntregas e retiradas acontecem das 11h às 13h."
+            return self._delivery_mode_prompt()
         if waiting == "endereco":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_ENDERECO)
-            return "Pode me informar o endereço de entrega, por favor?"
+            return self._delivery_address_prompt()
+        if waiting == "nome_cliente":
+            update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE)
+            return self._customer_name_prompt()
         if waiting == "forma_pagamento":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_PAGAMENTO)
             return "Qual será a forma de pagamento? Pix, dinheiro ou cartão?"
         if waiting == "comprovante":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_COMPROVANTE)
-            return "Certo 😊 Pode enviar o comprovante por aqui assim que fizer o pagamento."
+            return self._pix_payment_instructions(state)
 
         update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_CONFIRMACAO)
         return "Posso seguir com esse pedido? Se estiver tudo certo, me confirme por favor."
@@ -1584,12 +2162,14 @@ class OrderAgent:
             return next_question
 
         if state.itens_pedido and pricing.get("can_calculate"):
+            if state.endereco and not self._get_customer_name(state.telefone):
+                return f"Perfeito 😊 Endereço anotado. {self._customer_name_prompt()}"
             if state.endereco and not state.forma_pagamento:
                 return "Perfeito 😊 Endereço anotado. Qual será a forma de pagamento? Pix, dinheiro ou cartão?"
             if state.forma_pagamento and state.forma_pagamento != "Pix":
                 return self._build_order_summary(state)
             if state.forma_pagamento == "Pix":
-                return f"Certo 😊 Pode enviar o comprovante por aqui assim que fizer o pagamento."
+                return self._pix_payment_instructions(state)
             return next_question
 
         if (
@@ -1608,15 +2188,16 @@ class OrderAgent:
                 produto = self._human_product_name(state.produto, state.quantidade)
                 return (
                     f"Perfeito 😊 {produto} ficam em {total}.\n\n"
-                    "Você prefere:\n\n1 - Entrega\n2 - Retirada no local\n\n"
-                    "Entregas e retiradas acontecem das 11h às 13h."
+                    f"{self._delivery_mode_prompt()}"
                 )
             if state.tipo_entrega != "retirada" and not state.endereco:
                 produto = self._human_product_name(state.produto, state.quantidade)
                 return (
                     f"Perfeito 😊 {produto} ficam em {total}. "
-                    "Pode me informar o endereço de entrega, por favor?"
+                    f"{self._delivery_address_prompt()}"
                 )
+            if not self._get_customer_name(state.telefone):
+                return f"Perfeito! Valor parcial do pedido: {total}. {self._customer_name_prompt()}"
             return f"Perfeito! Valor parcial do pedido: {total}. {next_question}"
 
         return next_question
@@ -1638,18 +2219,19 @@ class OrderAgent:
 
     def _build_order_summary(self, state) -> str:
         total = f"R$ {state.valor_total:.2f}".replace(".", ",")
+        customer_name = self._get_customer_name(state.telefone)
         if state.itens_pedido:
-            item_lines = []
-            for item in state.itens_pedido:
-                subtotal = f"R$ {float(item['subtotal']):.2f}".replace(".", ",")
-                qty = int(item["quantidade"])
-                produto = self._pluralize_produto(item["produto"], qty)
-                item_lines.append(f"• {qty} {produto}: {subtotal}")
-            itens = "\n".join(item_lines)
+            itens = "\n".join(line.replace("* ", "• ") for line in self._order_item_lines(state))
+            receiving_lines = [f"• Forma de recebimento: {self._receiving_label(state)}"]
+            if state.tipo_entrega == "entrega" and state.endereco:
+                receiving_lines.append(f"• Endereço: {state.endereco}")
+            if customer_name:
+                receiving_lines.append(f"• Nome: {customer_name}")
             return (
                 "Resumo do seu pedido:\n\n"
                 f"{itens}\n"
-                f"• Entrega: {state.endereco}\n"
+                + "\n".join(receiving_lines)
+                + "\n"
                 f"• Forma de pagamento: {state.forma_pagamento}\n\n"
                 f"Total: {total}\n\n"
                 "Posso seguir com esse pedido?\n"
@@ -1657,15 +2239,49 @@ class OrderAgent:
             )
 
         produto_legivel = self._human_product_name(state.produto, state.quantidade)
+        receiving_lines = [f"• Forma de recebimento: {self._receiving_label(state)}"]
+        if state.tipo_entrega == "entrega" and state.endereco:
+            receiving_lines.append(f"• Endereço: {state.endereco}")
+        if customer_name:
+            receiving_lines.append(f"• Nome: {customer_name}")
         return (
             "Resumo do seu pedido:\n\n"
             f"• {produto_legivel}\n"
-            f"• Entrega: {state.endereco}\n"
+            + "\n".join(receiving_lines)
+            + "\n"
             f"• Forma de pagamento: {state.forma_pagamento}\n\n"
             f"Total: {total}\n\n"
             "Posso seguir com esse pedido?\n"
             "Se estiver tudo certo, me confirme por favor."
         )
+
+    def _build_confirmed_order_response(self, state) -> str:
+        total = f"R$ {state.valor_total:.2f}".replace(".", ",")
+        customer_name = self._get_customer_name(state.telefone)
+        lines = ["Pedido confirmado com sucesso 😊", "", "Resumo do pedido:", ""]
+        lines.extend(self._order_item_lines(state))
+        lines.append("")
+        lines.append(f"* Forma de recebimento: {self._receiving_label(state)}")
+        if state.tipo_entrega == "entrega" and state.endereco:
+            lines.append(f"* Endereço: {state.endereco}")
+        if customer_name:
+            lines.append(f"* Nome: {customer_name}")
+        lines.append(f"* Forma de pagamento: {state.forma_pagamento}")
+        lines.extend(["", f"Total: {total}", ""])
+
+        if state.tipo_entrega == "retirada" and customer_name:
+            lines.append(
+                f"A equipe da Marmitaria da Adriana já pode preparar seu pedido. "
+                f"Quando chegar, informe o nome {customer_name} para retirar."
+            )
+        elif state.tipo_entrega == "entrega":
+            lines.append(
+                "A equipe da Marmitaria da Adriana já pode preparar seu pedido. "
+                "Vamos preparar seu pedido para entrega no endereço informado."
+            )
+        else:
+            lines.append("A equipe da Marmitaria da Adriana já pode preparar seu pedido.")
+        return "\n".join(lines)
 
     def _build_payment_proof_received_response(self, state) -> str:
         total = f"R$ {state.valor_total:.2f}".replace(".", ",")
@@ -1681,6 +2297,9 @@ class OrderAgent:
                 qty = int(item["quantidade"])
                 produto = self._pluralize_produto(item["produto"], qty)
                 item_lines.append(f"* {qty} {produto}: {subtotal}")
+                observation = (item.get("observacao") or "").strip()
+                if observation:
+                    item_lines.append(f"* Observação: {observation}")
             lines.extend(["", "Resumo do pedido:", *item_lines, f"Total: {total}"])
         elif state.produto:
             produto_legivel = self._human_product_name(state.produto, state.quantidade)
@@ -1689,7 +2308,13 @@ class OrderAgent:
         lines.append("A equipe precisa validar o comprovante antes de confirmar o pedido.")
         return "\n".join(lines)
 
-    def _build_items_summary_response(self, items: list[dict], total: float, ask_address: bool) -> str:
+    def _build_items_summary_response(
+        self,
+        items: list[dict],
+        total: float,
+        ask_address: bool,
+        show_partial_label: bool = False,
+    ) -> str:
         lines = ["Perfeito 😊 Seu pedido ficou assim:", ""]
         for item in items:
             subtotal = f"R$ {float(item['subtotal']):.2f}".replace(".", ",")
@@ -1697,20 +2322,18 @@ class OrderAgent:
             produto = item["produto"]
             produto_label = self._pluralize_produto(produto, qty)
             if qty == 1:
-                lines.append(f"• 1 {produto}: {subtotal}")
+                lines.append(f"* 1 {produto}: {subtotal}")
             else:
-                lines.append(f"• {qty} {produto_label}: {subtotal}")
+                lines.append(f"* {qty} {produto_label}: {subtotal}")
+            observation = (item.get("observacao") or "").strip()
+            if observation:
+                lines.append(f"* Observação: {observation}")
         total_str = f"R$ {float(total):.2f}".replace(".", ",")
         lines.append("")
-        lines.append(f"Total: {total_str}")
+        total_label = "Total parcial" if show_partial_label else "Total"
+        lines.append(f"{total_label}: {total_str}")
         if ask_address:
-            lines.append("")
-            lines.append("Você prefere:")
-            lines.append("")
-            lines.append("1 - Entrega")
-            lines.append("2 - Retirada no local")
-            lines.append("")
-            lines.append("Entregas e retiradas acontecem das 11h às 13h.")
+            lines.extend(["", self._delivery_mode_prompt()])
         return "\n".join(lines)
 
     def _pluralize_produto(self, produto: str, quantidade: int) -> str:
@@ -1723,14 +2346,15 @@ class OrderAgent:
         return produto
 
     def _marmita_type_prompt(self) -> str:
-        return (
-            "Você deseja:\n\n"
-            "1 - Marmitex individual\n"
-            "2 - Marmita para 2 pessoas\n"
-            "3 - Marmita para 3 pessoas\n"
-            "4 - Marmita para 4 pessoas\n"
-            "5 - Marmita para 5 pessoas"
-        )
+        choices = [
+            item
+            for item in get_order_product_choices()
+            if item["key"] == "marmitex_individual" or item["people_count"] <= self._owner_threshold()
+        ]
+        lines = ["Você deseja:", ""]
+        for item in choices:
+            lines.append(f"{item['choice']} - {item['nome']}")
+        return "\n".join(lines)
 
 
 def run_order_agent_quantity_tests() -> dict:

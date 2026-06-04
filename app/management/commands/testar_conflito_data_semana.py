@@ -39,7 +39,7 @@ class Command(BaseCommand):
             "## segunda-feira\n"
             "- Feijoada\n- Arroz\n- Farofa\n"
             "## terca-feira\n"
-            "- Frango grelhado\n- Arroz\n- Feijao\n"
+            "- Frango grelhado\n- Arroz\n- Feijão\n"
         )
         # Simula domingo 31/05/2026 para teste deterministico.
         orchestrator_module.timezone.localdate = lambda: date(2026, 5, 31)

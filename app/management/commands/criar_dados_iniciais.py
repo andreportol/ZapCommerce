@@ -1,8 +1,9 @@
+from datetime import time
 from decimal import Decimal
 
 from django.core.management.base import BaseCommand
 
-from app.models import ConfiguracaoMarmitaria, Produto
+from app.models import CardapioDia, ConfiguracaoMarmitaria, DiaSemana, HorarioFuncionamentoDia, Produto
 
 
 class Command(BaseCommand):
@@ -17,11 +18,65 @@ class Command(BaseCommand):
                 'chave_pix': 'pix@exemplo.com',
                 'horario_funcionamento': 'Seg a Sab - 10h as 14h',
                 'taxa_entrega_padrao': Decimal('5.00'),
+                'aceita_pedidos': True,
+                'aceita_entrega': True,
+                'aceita_retirada_local': True,
+                'pedido_maximo_sem_consulta': 5,
+                'endereco_retirada': 'Balcao da marmitaria',
                 'mensagem_boas_vindas': 'Ola! Seja bem-vindo(a) a nossa marmitaria 😊 Posso te mostrar o cardapio de hoje ou voce ja sabe o que deseja pedir?',
                 'mensagem_fora_horario': 'Estamos fora do horario de atendimento no momento.',
             },
         )
         self.stdout.write(self.style.SUCCESS('Configuracao criada.' if created else 'Configuracao ja existia.'))
+
+        horarios = {
+            DiaSemana.SEGUNDA: ['Feijoada da casa', 'Arroz branco', 'Farofa', 'Couve refogada'],
+            DiaSemana.TERCA: ['Frango assado', 'Arroz', 'Feijão carioca', 'Macarrão alho e óleo'],
+            DiaSemana.QUARTA: ['Bife acebolado', 'Arroz', 'Feijão tropeiro', 'Purê de batata'],
+            DiaSemana.QUINTA: ['Strogonoff de frango', 'Arroz', 'Batata palha', 'Salada'],
+            DiaSemana.SEXTA: ['Peixe empanado', 'Arroz', 'Purê', 'Legumes'],
+            DiaSemana.SABADO: ['Costela assada', 'Arroz', 'Mandioca cozida', 'Vinagrete'],
+        }
+
+        for dia_semana, itens in horarios.items():
+            HorarioFuncionamentoDia.objects.update_or_create(
+                configuracao=config,
+                dia_semana=dia_semana,
+                defaults={
+                    'fechado': False,
+                    'abre_pedidos': time(9, 0),
+                    'fecha_pedidos': time(12, 30),
+                    'abre_entregas': time(11, 0),
+                    'fecha_entregas': time(13, 0),
+                    'abre_retiradas': time(11, 0),
+                    'fecha_retiradas': time(13, 0),
+                    'observacoes': '',
+                },
+            )
+            CardapioDia.objects.update_or_create(
+                configuracao=config,
+                dia_semana=dia_semana,
+                defaults={
+                    'titulo': f'Cardapio de {dia_semana}',
+                    'descricao': '\n'.join(f'- {item}' for item in itens),
+                    'ativo': True,
+                },
+            )
+
+        HorarioFuncionamentoDia.objects.update_or_create(
+            configuracao=config,
+            dia_semana=DiaSemana.DOMINGO,
+            defaults={
+                'fechado': True,
+                'abre_pedidos': None,
+                'fecha_pedidos': None,
+                'abre_entregas': None,
+                'fecha_entregas': None,
+                'abre_retiradas': None,
+                'fecha_retiradas': None,
+                'observacoes': 'Fechado',
+            },
+        )
 
         produtos = [
             ('Marmitex individual', 'Opcao individual', Decimal('21.00'), Produto.Categoria.MARMITA_PEQUENA),
@@ -47,3 +102,4 @@ class Command(BaseCommand):
             )
 
         self.stdout.write(self.style.SUCCESS('Produtos iniciais criados/garantidos.'))
+        self.stdout.write(self.style.SUCCESS('Horarios e cardapios iniciais criados/garantidos.'))

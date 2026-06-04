@@ -1,0 +1,76 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Entrar | Marmitaria da Adriana</title>
+    <meta name="description" content="Acesse o painel da Marmitaria da Adriana.">
+    <link rel="stylesheet" href="{% static 'app/css/landing.css' %}">
+    <link rel="stylesheet" href="{% static 'app/css/auth.css' %}">
+</head>
+<body>
+    <div class="page-shell auth-shell">
+        <header class="site-header auth-header">
+            <a class="brand" href="/">Marmitaria da Adriana</a>
+            <a class="header-link" href="/">Voltar</a>
+        </header>
+
+        <main class="auth-main">
+            <section class="auth-card">
+                <div class="auth-copy">
+                    <p class="eyebrow">Acesso ao sistema</p>
+                    <h1>Entrar no painel</h1>
+                    <p>
+                        Faça login para acessar a área administrativa da Marmitaria da Adriana.
+                    </p>
+                </div>
+
+                <form method="post" class="auth-form">
+                    {% csrf_token %}
+
+                    {% if form.non_field_errors %}
+                        <div class="auth-alert" role="alert">
+                            {% for error in form.non_field_errors %}
+                                <p>{{ error }}</p>
+                            {% endfor %}
+                        </div>
+                    {% endif %}
+
+                    <div class="form-row">
+                        <label for="{{ form.username.id_for_label }}">{{ form.username.label }}</label>
+                        {{ form.username }}
+                        {% if form.username.errors %}
+                            <div class="field-error">{{ form.username.errors|join:", " }}</div>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-row">
+                        <label for="{{ form.password.id_for_label }}">Senha</label>
+                        <input
+                            type="password"
+                            name="password"
+                            id="{{ form.password.id_for_label }}"
+                            autocomplete="current-password"
+                            placeholder="Digite sua senha"
+                            required
+                        >
+                        {% if form.password.errors %}
+                            <div class="field-error">{{ form.password.errors|join:", " }}</div>
+                        {% endif %}
+                    </div>
+
+                    {% if next %}
+                        <input type="hidden" name="next" value="{{ next }}">
+                    {% endif %}
+
+                    <div class="auth-actions">
+                        <button class="button button-primary" type="submit">Entrar</button>
+                        <a class="button button-secondary" href="/">Voltar para página inicial</a>
+                    </div>
+                </form>
+            </section>
+        </main>
+    </div>
+</body>
+</html>

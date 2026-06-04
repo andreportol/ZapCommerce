@@ -1,0 +1,32 @@
+<svg width="640" height="640" viewBox="0 0 640 640" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="640" height="640" rx="140" fill="#FFF7EA"/>
+  <circle cx="320" cy="240" r="176" fill="url(#paint0_linear)"/>
+  <circle cx="320" cy="240" r="142" fill="#741F2D"/>
+  <path d="M229 224C229 171.533 271.533 129 324 129H414C450.451 129 480 158.549 480 195V285C480 337.467 437.467 380 385 380H295C258.549 380 229 350.451 229 314V224Z" fill="url(#paint1_linear)"/>
+  <path d="M182 241C182 163.68 244.68 101 322 101H337C414.32 101 477 163.68 477 241V256C477 333.32 414.32 396 337 396H322C244.68 396 182 333.32 182 256V241Z" fill="url(#paint2_linear)" fill-opacity="0.55"/>
+  <path d="M188 236C188 153.873 254.873 87 337 87C406.984 87 466.766 135.347 482.073 201.7C462.559 177.444 432.625 162 399.098 162H275.17C247.522 162 225.111 184.411 225.111 212.059V308.809C225.111 330.783 237.239 350.259 255.293 360.419C215.158 334.467 188 288.873 188 236Z" fill="url(#paint3_linear)"/>
+  <text x="320" y="510" text-anchor="middle" fill="#741F2D" font-family="Georgia, 'Times New Roman', serif" font-size="46" font-weight="700" letter-spacing="3">
+    MARMITARIA
+  </text>
+  <text x="320" y="558" text-anchor="middle" fill="#D8A125" font-family="Georgia, 'Times New Roman', serif" font-size="44" font-weight="700" letter-spacing="5">
+    DA ADRIANA
+  </text>
+  <defs>
+    <linearGradient id="paint0_linear" x1="144" y1="58" x2="482" y2="406" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4C43F"/>
+      <stop offset="1" stop-color="#E2A720"/>
+    </linearGradient>
+    <linearGradient id="paint1_linear" x1="229" y1="129" x2="482" y2="380" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF4CF"/>
+      <stop offset="1" stop-color="#F3CF6A"/>
+    </linearGradient>
+    <linearGradient id="paint2_linear" x1="182" y1="101" x2="477" y2="396" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D8A125"/>
+      <stop offset="1" stop-color="#F2D27D"/>
+    </linearGradient>
+    <linearGradient id="paint3_linear" x1="188" y1="87" x2="482" y2="360.419" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A62D3F"/>
+      <stop offset="1" stop-color="#56131E"/>
+    </linearGradient>
+  </defs>
+</svg>

@@ -4,6 +4,16 @@ from django.core.exceptions import ValidationError
 from django.db import models
 
 
+class DiaSemana(models.TextChoices):
+    SEGUNDA = 'segunda-feira', 'Segunda-feira'
+    TERCA = 'terca-feira', 'Terca-feira'
+    QUARTA = 'quarta-feira', 'Quarta-feira'
+    QUINTA = 'quinta-feira', 'Quinta-feira'
+    SEXTA = 'sexta-feira', 'Sexta-feira'
+    SABADO = 'sabado', 'Sabado'
+    DOMINGO = 'domingo', 'Domingo'
+
+
 class BaseTimestampModel(models.Model):
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
@@ -158,11 +168,18 @@ class ConfiguracaoMarmitaria(BaseTimestampModel):
     chave_pix = models.CharField(max_length=120, blank=True)
     horario_funcionamento = models.CharField(max_length=255, blank=True)
     taxa_entrega_padrao = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
+    aceita_pedidos = models.BooleanField(default=True)
+    aceita_entrega = models.BooleanField(default=True)
+    aceita_retirada_local = models.BooleanField(default=True)
+    pedido_maximo_sem_consulta = models.PositiveSmallIntegerField(default=5)
+    endereco_retirada = models.CharField(max_length=255, blank=True)
     mensagem_boas_vindas = models.TextField(blank=True)
     mensagem_fora_horario = models.TextField(blank=True)
     ativo = models.BooleanField(default=True)
 
     def clean(self):
+        if self.aceita_pedidos and not (self.aceita_entrega or self.aceita_retirada_local):
+            raise ValidationError('Habilite entrega ou retirada para aceitar pedidos.')
         if self.ativo:
             qs = ConfiguracaoMarmitaria.objects.filter(ativo=True)
             if self.pk:
@@ -172,3 +189,75 @@ class ConfiguracaoMarmitaria(BaseTimestampModel):
 
     def __str__(self):
         return self.nome_empresa
+
+
+class HorarioFuncionamentoDia(BaseTimestampModel):
+    configuracao = models.ForeignKey(
+        ConfiguracaoMarmitaria,
+        on_delete=models.CASCADE,
+        related_name='horarios_funcionamento',
+    )
+    dia_semana = models.CharField(max_length=20, choices=DiaSemana.choices)
+    fechado = models.BooleanField(default=False)
+    abre_pedidos = models.TimeField(null=True, blank=True)
+    fecha_pedidos = models.TimeField(null=True, blank=True)
+    abre_entregas = models.TimeField(null=True, blank=True)
+    fecha_entregas = models.TimeField(null=True, blank=True)
+    abre_retiradas = models.TimeField(null=True, blank=True)
+    fecha_retiradas = models.TimeField(null=True, blank=True)
+    observacoes = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ['dia_semana']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['configuracao', 'dia_semana'],
+                name='unique_horario_por_configuracao_dia',
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.fechado:
+            return
+
+        if not self.abre_pedidos or not self.fecha_pedidos:
+            raise ValidationError('Dias abertos precisam ter horario de pedidos preenchido.')
+
+        if self.abre_pedidos >= self.fecha_pedidos:
+            raise ValidationError('O horario de fechamento de pedidos deve ser maior que o de abertura.')
+
+        if self.abre_entregas and self.fecha_entregas and self.abre_entregas >= self.fecha_entregas:
+            raise ValidationError('O horario de fechamento das entregas deve ser maior que o de abertura.')
+
+        if self.abre_retiradas and self.fecha_retiradas and self.abre_retiradas >= self.fecha_retiradas:
+            raise ValidationError('O horario de fechamento das retiradas deve ser maior que o de abertura.')
+
+    def __str__(self):
+        return f'{self.get_dia_semana_display()} - {self.configuracao.nome_empresa}'
+
+
+class CardapioDia(BaseTimestampModel):
+    configuracao = models.ForeignKey(
+        ConfiguracaoMarmitaria,
+        on_delete=models.CASCADE,
+        related_name='cardapios_dia',
+    )
+    dia_semana = models.CharField(max_length=20, choices=DiaSemana.choices)
+    titulo = models.CharField(max_length=120, blank=True)
+    descricao = models.TextField(
+        help_text='Liste os itens do dia. Pode usar uma linha por item ou bullets.',
+    )
+    ativo = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['dia_semana']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['configuracao', 'dia_semana'],
+                name='unique_cardapio_por_configuracao_dia',
+            )
+        ]
+
+    def __str__(self):
+        return f'{self.get_dia_semana_display()} - {self.configuracao.nome_empresa}'

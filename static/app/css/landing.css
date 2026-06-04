@@ -1,0 +1,533 @@
+:root {
+    --cream: #fff8ef;
+    --sand: #f4e0bc;
+    --gold: #d8a125;
+    --gold-soft: #f0cf78;
+    --wine: #741f2d;
+    --wine-deep: #51101c;
+    --amber: #d98a1f;
+    --ink: #2c1915;
+    --card: rgba(255, 252, 246, 0.92);
+    --line: rgba(116, 31, 45, 0.14);
+    --shadow: 0 24px 48px rgba(86, 24, 35, 0.12);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html {
+    scroll-behavior: smooth;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+        radial-gradient(circle at top left, rgba(216, 161, 37, 0.24), transparent 28%),
+        radial-gradient(circle at top right, rgba(116, 31, 45, 0.16), transparent 30%),
+        linear-gradient(180deg, #fffdf9 0%, var(--cream) 50%, #fff8ee 100%);
+    color: var(--ink);
+    font-family: "Trebuchet MS", "Avenir Next", "Segoe UI", sans-serif;
+}
+
+a {
+    color: inherit;
+    text-decoration: none;
+}
+
+button {
+    font: inherit;
+}
+
+.page-shell {
+    width: min(1180px, calc(100% - 32px));
+    margin: 0 auto;
+    padding: 24px 0 56px;
+}
+
+.site-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 12px 0 24px;
+}
+
+.brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    min-width: 0;
+}
+
+.brand-logo {
+    width: 64px;
+    height: 64px;
+    flex-shrink: 0;
+    filter: drop-shadow(0 10px 20px rgba(116, 31, 45, 0.16));
+}
+
+.brand-text {
+    font-family: "Georgia", "Times New Roman", serif;
+    font-size: 1.2rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--wine);
+}
+
+.header-link,
+.button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 50px;
+    padding: 0 22px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    font-weight: 700;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.header-link:hover,
+.button:hover {
+    transform: translateY(-1px);
+}
+
+.header-link {
+    background: rgba(255, 255, 255, 0.78);
+    border-color: var(--line);
+    box-shadow: 0 14px 24px rgba(116, 31, 45, 0.08);
+    color: var(--wine);
+}
+
+.button-primary {
+    background: linear-gradient(135deg, var(--wine), #a22e40);
+    color: #fffaf4;
+    box-shadow: 0 20px 30px rgba(116, 31, 45, 0.24);
+}
+
+.button-secondary {
+    background: rgba(255, 255, 255, 0.88);
+    border-color: var(--line);
+    color: var(--wine);
+}
+
+.button-ghost {
+    background: rgba(216, 161, 37, 0.14);
+    border-color: rgba(216, 161, 37, 0.22);
+    color: var(--ink);
+}
+
+.hero-section {
+    display: grid;
+    grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+    gap: 28px;
+    align-items: stretch;
+    padding: 24px 0 42px;
+}
+
+.hero-copy,
+.hero-plate,
+.carousel,
+.about-card,
+.info-card,
+.cta-card {
+    border-radius: 30px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+}
+
+.hero-copy {
+    padding: 44px;
+}
+
+.eyebrow {
+    margin: 0 0 16px;
+    color: var(--amber);
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+.hero-copy h1,
+.section-heading h2,
+.slide-copy h3,
+.cta-card h2 {
+    margin: 0;
+    font-family: "Georgia", "Times New Roman", serif;
+    line-height: 1.06;
+}
+
+.hero-copy h1 {
+    font-size: clamp(2.3rem, 4.2vw, 4.8rem);
+    max-width: 12ch;
+}
+
+.hero-text {
+    max-width: 58ch;
+    margin: 20px 0 0;
+    font-size: 1.08rem;
+    line-height: 1.72;
+    color: rgba(44, 25, 21, 0.8);
+}
+
+.hero-actions,
+.cta-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+}
+
+.hero-actions {
+    margin-top: 30px;
+}
+
+.hero-visual {
+    display: flex;
+}
+
+.hero-plate {
+    width: 100%;
+    padding: 28px;
+    display: grid;
+    place-items: center;
+    gap: 18px;
+    background:
+        radial-gradient(circle at top, rgba(240, 207, 120, 0.52), transparent 48%),
+        linear-gradient(180deg, rgba(255, 251, 242, 0.98), rgba(246, 230, 189, 0.86));
+}
+
+.hero-logo {
+    width: min(100%, 360px);
+    height: auto;
+}
+
+.hero-badge {
+    padding: 12px 18px;
+    border-radius: 999px;
+    background: rgba(116, 31, 45, 0.08);
+    color: var(--wine);
+    font-weight: 700;
+    text-align: center;
+}
+
+.carousel-section,
+.about-section,
+.info-section,
+.cta-section {
+    padding: 26px 0;
+}
+
+.section-heading {
+    margin-bottom: 22px;
+}
+
+.section-heading h2 {
+    font-size: clamp(1.9rem, 3vw, 3rem);
+}
+
+.carousel {
+    position: relative;
+    overflow: hidden;
+    padding: 28px;
+    background:
+        linear-gradient(135deg, rgba(255, 250, 242, 0.98), rgba(245, 225, 182, 0.74));
+}
+
+.carousel-track {
+    position: relative;
+    min-height: 420px;
+}
+
+.carousel-slide {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    grid-template-columns: minmax(240px, 0.86fr) minmax(0, 1.14fr);
+    gap: 22px;
+    align-items: center;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(4%);
+    transition: opacity 0.42s ease, transform 0.42s ease;
+}
+
+.carousel-slide.is-active {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(0);
+}
+
+.slide-media,
+.slide-copy {
+    height: 100%;
+    border-radius: 24px;
+}
+
+.slide-media {
+    display: grid;
+    place-items: center;
+    padding: 26px;
+    background:
+        radial-gradient(circle at top left, rgba(216, 161, 37, 0.34), transparent 34%),
+        linear-gradient(135deg, rgba(116, 31, 45, 0.96), rgba(81, 16, 28, 0.92));
+    color: #fff9f3;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.slide-media img {
+    width: min(100%, 280px);
+    height: auto;
+}
+
+.slide-placeholder {
+    align-content: end;
+    text-align: left;
+    background:
+        radial-gradient(circle at top, rgba(255, 212, 114, 0.34), transparent 42%),
+        linear-gradient(135deg, #7c2431, #9f6231);
+}
+
+.slide-hours {
+    background:
+        radial-gradient(circle at top, rgba(240, 207, 120, 0.24), transparent 40%),
+        linear-gradient(135deg, #6b1a27, #7d3e18);
+}
+
+.slide-location {
+    background:
+        radial-gradient(circle at top, rgba(255, 232, 178, 0.22), transparent 42%),
+        linear-gradient(135deg, #4e1620, #8b2836);
+}
+
+.slide-placeholder div {
+    max-width: 24ch;
+}
+
+.placeholder-kicker,
+.slide-tag {
+    display: inline-flex;
+    margin-bottom: 14px;
+    padding: 8px 12px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+
+.placeholder-kicker {
+    background: rgba(255, 255, 255, 0.14);
+    color: #fff2d1;
+}
+
+.slide-placeholder strong {
+    display: block;
+    font-family: "Georgia", "Times New Roman", serif;
+    font-size: clamp(1.6rem, 2.8vw, 2.5rem);
+    line-height: 1.1;
+}
+
+.slide-copy {
+    padding: 24px 8px 24px 6px;
+}
+
+.slide-tag {
+    background: rgba(116, 31, 45, 0.08);
+    color: var(--wine);
+}
+
+.slide-copy h3 {
+    font-size: clamp(1.9rem, 3vw, 3rem);
+    color: var(--wine-deep);
+}
+
+.slide-copy p {
+    margin: 18px 0 0;
+    max-width: 48ch;
+    line-height: 1.72;
+    color: rgba(44, 25, 21, 0.78);
+}
+
+.carousel-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 22px;
+}
+
+.carousel-button {
+    width: 48px;
+    height: 48px;
+    border: 1px solid var(--line);
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.92);
+    color: var(--wine);
+    box-shadow: 0 12px 22px rgba(116, 31, 45, 0.1);
+    cursor: pointer;
+}
+
+.carousel-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.carousel-dot {
+    width: 12px;
+    height: 12px;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: rgba(116, 31, 45, 0.22);
+    cursor: pointer;
+}
+
+.carousel-dot.is-active {
+    width: 30px;
+    background: linear-gradient(135deg, var(--wine), var(--amber));
+}
+
+.about-card {
+    padding: 34px;
+}
+
+.about-card p {
+    margin: 0;
+    line-height: 1.8;
+    color: rgba(44, 25, 21, 0.8);
+}
+
+.about-card p + p {
+    margin-top: 16px;
+}
+
+.info-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 18px;
+}
+
+.info-card {
+    padding: 24px;
+}
+
+.info-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 54px;
+    height: 54px;
+    margin-bottom: 18px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, rgba(216, 161, 37, 0.9), rgba(240, 207, 120, 0.9));
+    box-shadow: 0 14px 26px rgba(216, 161, 37, 0.18);
+    font-size: 1.4rem;
+}
+
+.info-card h3 {
+    margin: 0 0 10px;
+    color: var(--wine);
+    font-size: 1.08rem;
+}
+
+.info-card p {
+    margin: 0;
+    line-height: 1.68;
+    color: rgba(44, 25, 21, 0.76);
+}
+
+.cta-card {
+    padding: 38px;
+    text-align: center;
+    background:
+        linear-gradient(135deg, rgba(116, 31, 45, 0.08), rgba(216, 161, 37, 0.16)),
+        var(--card);
+}
+
+.cta-card h2 {
+    max-width: 17ch;
+    margin: 0 auto 24px;
+    font-size: clamp(2rem, 3vw, 3.2rem);
+}
+
+.cta-actions {
+    justify-content: center;
+}
+
+@media (max-width: 1024px) {
+    .hero-section,
+    .carousel-slide,
+    .info-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .carousel-track {
+        min-height: 560px;
+    }
+
+    .slide-copy {
+        padding: 0;
+    }
+}
+
+@media (max-width: 720px) {
+    .page-shell {
+        width: min(100% - 20px, 1180px);
+        padding-top: 16px;
+    }
+
+    .site-header {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .brand {
+        justify-content: center;
+    }
+
+    .brand-logo {
+        width: 56px;
+        height: 56px;
+    }
+
+    .brand-text {
+        font-size: 1rem;
+        line-height: 1.25;
+    }
+
+    .header-link,
+    .button {
+        width: 100%;
+    }
+
+    .hero-copy,
+    .hero-plate,
+    .carousel,
+    .about-card,
+    .info-card,
+    .cta-card {
+        padding: 24px 20px;
+        border-radius: 24px;
+    }
+
+    .hero-actions,
+    .cta-actions {
+        flex-direction: column;
+    }
+
+    .hero-copy h1 {
+        max-width: none;
+    }
+
+    .carousel-track {
+        min-height: 620px;
+    }
+
+    .carousel-controls {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+}

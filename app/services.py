@@ -76,6 +76,18 @@ def obter_historico(conversa: Conversa, limite: int = 20):
     return list(conversa.mensagens.order_by('-criado_em')[:limite][::-1])
 
 
+def _fallback_recovery_response() -> str:
+    return (
+        "Desculpe, tive uma dificuldade para continuar seu atendimento 😕\n"
+        "Vamos recomeçar.\n\n"
+        "Como posso ajudar?\n\n"
+        "1 - Fazer pedido\n"
+        "2 - Saber o cardápio\n"
+        "3 - Mais informações\n"
+        "4 - Falar com a atendente"
+    )
+
+
 def gerar_resposta_atendimento(
     texto: str,
     telefone: str = '',
@@ -93,11 +105,18 @@ def gerar_resposta_atendimento(
         if resposta:
             return resposta
     except Exception as exc:
-        logger.exception('Falha ao gerar resposta com OrchestratorAgent: %s', exc)
-    return (
-        'Nao consegui continuar seu atendimento agora com seguranca. '
-        'Pode reformular a mensagem ou pedir para falar com a atendente?'
+        logger.exception(
+            'Falha ao gerar resposta com OrchestratorAgent telefone=%s texto=%r erro=%s acao=fallback',
+            telefone,
+            texto,
+            exc,
+        )
+    logger.warning(
+        'Resposta vazia no atendimento telefone=%s texto=%r acao=fallback_menu',
+        telefone,
+        texto,
     )
+    return _fallback_recovery_response()
 
 
 def deve_encaminhar_para_humano(texto: str, resposta: str) -> bool:
@@ -130,6 +149,10 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
     """
     Em producao, mover este processamento para Celery + Redis para evitar bloquear o webhook.
     """
+    telefone = ''
+    texto = ''
+    resposta = ''
+    conversa = None
     try:
         changes = payload.get('entry', [])[0].get('changes', [])
         if not changes:
@@ -163,7 +186,13 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
             return
 
         if not texto:
-            logger.info('Mensagem nao textual recebida. Estrutura preparada para futura extensao.')
+            logger.info('Mensagem nao textual recebida telefone=%s tipo=%s. Respondendo fallback de formato.', telefone, tipo)
+            resposta = (
+                'Recebi sua mensagem 😊\n\n'
+                'No momento consigo te atender melhor por texto, imagem ou PDF. '
+                'Se preferir, digite menu para recomeçar.'
+            )
+            enviar_mensagem_whatsapp(telefone=telefone, texto=resposta)
             return
 
         with transaction.atomic():
@@ -208,7 +237,32 @@ def processar_mensagem_whatsapp(payload: dict) -> None:
                 logger.exception('Falha ao salvar mensagem de sistema sobre erro de envio.')
 
     except Exception as exc:
-        logger.exception('Erro ao processar webhook: %s', exc)
+        logger.exception(
+            'Erro ao processar webhook telefone=%s texto=%r erro=%s acao=fallback_envio',
+            telefone,
+            texto,
+            exc,
+        )
+        if not telefone:
+            return
+        fallback_text = _fallback_recovery_response()
+        try:
+            enviar_mensagem_whatsapp(telefone=telefone, texto=fallback_text)
+        except Exception:
+            logger.exception(
+                'Falha ao enviar fallback do webhook telefone=%s texto=%r',
+                telefone,
+                texto,
+            )
+        try:
+            if conversa is not None:
+                salvar_mensagem(conversa, Mensagem.Origem.SISTEMA, fallback_text)
+        except Exception:
+            logger.exception(
+                'Falha ao registrar fallback do webhook telefone=%s texto=%r',
+                telefone,
+                texto,
+            )
 
 
 def parse_decimal(valor):

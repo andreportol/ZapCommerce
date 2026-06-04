@@ -1,0 +1,272 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MARMITARIA DA ADRIANA</title>
+    <meta
+        name="description"
+        content="Marmitas saborosas com atendimento inteligente pelo WhatsApp, cardápio do dia, entregas e retirada no local."
+    >
+    <link rel="stylesheet" href="{% static 'app/css/landing.css' %}">
+</head>
+<body>
+    <div class="page-shell">
+        <header class="site-header">
+            <a class="brand" href="/" aria-label="Marmitaria da Adriana">
+                <img
+                    class="brand-logo"
+                    src="{% static 'app/img/logo-marmitaria-adriana.svg' %}"
+                    alt="Logotipo da Marmitaria da Adriana"
+                >
+                <span class="brand-text">MARMITARIA DA ADRIANA</span>
+            </a>
+            <a class="header-link" href="/login/">Entrar</a>
+        </header>
+
+        <main>
+            <section class="hero-section">
+                <div class="hero-copy">
+                    <p class="eyebrow">Atendimento prático, comida caseira e operação mais organizada</p>
+                    <h1>Marmitas saborosas com atendimento inteligente pelo WhatsApp</h1>
+                    <p class="hero-text">
+                        Faça seu pedido com praticidade, acompanhe o cardápio do dia e receba tudo com mais rapidez e organização.
+                    </p>
+                    <div class="hero-actions">
+                        <a
+                            class="button button-primary"
+                            href="https://wa.me/?text=Olá%2C%20quero%20fazer%20um%20pedido%20na%20Marmitaria%20da%20Adriana."
+                            target="_blank"
+                            rel="noopener noreferrer"
+                        >
+                            Fazer pedido pelo WhatsApp
+                        </a>
+                        <a class="button button-secondary" href="#informacoes">Ver cardápio</a>
+                        <a class="button button-ghost" href="/login/">Entrar</a>
+                    </div>
+                </div>
+
+                <div class="hero-visual">
+                    <div class="hero-plate">
+                        <img
+                            class="hero-logo"
+                            src="{% static 'app/img/logo-marmitaria-adriana.svg' %}"
+                            alt="Marca da Marmitaria da Adriana"
+                        >
+                        <div class="hero-badge">Pedidos, cardápio e atendimento em um só lugar</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="carousel-section" aria-label="Destaques da Marmitaria da Adriana">
+                <div class="section-heading">
+                    <p class="eyebrow">Destaques</p>
+                    <h2>Uma vitrine pronta para apresentar a marmitaria</h2>
+                </div>
+
+                <div class="carousel" data-carousel>
+                    <div class="carousel-track">
+                        <article class="carousel-slide is-active">
+                            <div class="slide-media">
+                                <img
+                                    src="{% static 'app/img/logo-marmitaria-adriana.svg' %}"
+                                    alt="Logotipo da Marmitaria da Adriana"
+                                >
+                            </div>
+                            <div class="slide-copy">
+                                <span class="slide-tag">Identidade</span>
+                                <h3>MARMITARIA DA ADRIANA</h3>
+                                <p>
+                                    Comida com cara de casa, atendimento acolhedor e um jeito mais simples de pedir pelo WhatsApp.
+                                </p>
+                            </div>
+                        </article>
+
+                        <article class="carousel-slide">
+                            <div class="slide-media slide-placeholder">
+                                <div>
+                                    <span class="placeholder-kicker">Cardápio do dia</span>
+                                    <strong>Marmitas, pratos do dia e praticidade para a rotina.</strong>
+                                </div>
+                            </div>
+                            <div class="slide-copy">
+                                <span class="slide-tag">Cardápio</span>
+                                <h3>Comida caseira com apresentação clara</h3>
+                                <p>
+                                    Destaque o prato do dia, as opções de marmita e incentive pedidos rápidos com um cardápio sempre visível.
+                                </p>
+                            </div>
+                        </article>
+
+                        <article class="carousel-slide">
+                            <div class="slide-media slide-placeholder slide-hours">
+                                <div>
+                                    <span class="placeholder-kicker">Horários e operação</span>
+                                    <strong>Entregas e retirada no local com fluxo organizado.</strong>
+                                </div>
+                            </div>
+                            <div class="slide-copy">
+                                <span class="slide-tag">Horários</span>
+                                <h3>Atendimento no ritmo da marmitaria</h3>
+                                <p>
+                                    Mostre horários de funcionamento, janelas de entrega e retirada para evitar dúvidas e reduzir retrabalho.
+                                </p>
+                            </div>
+                        </article>
+
+                        <article class="carousel-slide">
+                            <div class="slide-media slide-placeholder slide-location">
+                                <div>
+                                    <span class="placeholder-kicker">Localização e contato</span>
+                                    <strong>Facilidade para encontrar, pedir e acompanhar.</strong>
+                                </div>
+                            </div>
+                            <div class="slide-copy">
+                                <span class="slide-tag">Atendimento</span>
+                                <h3>Presença local com resposta mais rápida</h3>
+                                <p>
+                                    Estrutura preparada para destacar endereço, área de entrega e canais de contato da Marmitaria da Adriana.
+                                </p>
+                            </div>
+                        </article>
+                    </div>
+
+                    <div class="carousel-controls">
+                        <button class="carousel-button" type="button" data-carousel-prev aria-label="Slide anterior">‹</button>
+                        <div class="carousel-dots" aria-label="Navegação do carrossel">
+                            <button class="carousel-dot is-active" type="button" data-carousel-dot="0" aria-label="Ir para o slide 1"></button>
+                            <button class="carousel-dot" type="button" data-carousel-dot="1" aria-label="Ir para o slide 2"></button>
+                            <button class="carousel-dot" type="button" data-carousel-dot="2" aria-label="Ir para o slide 3"></button>
+                            <button class="carousel-dot" type="button" data-carousel-dot="3" aria-label="Ir para o slide 4"></button>
+                        </div>
+                        <button class="carousel-button" type="button" data-carousel-next aria-label="Próximo slide">›</button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="about-section">
+                <div class="section-heading">
+                    <p class="eyebrow">Sobre a marmitaria</p>
+                    <h2>Atendimento acolhedor com praticidade no dia a dia</h2>
+                </div>
+                <div class="about-card">
+                    <p>
+                        A MARMITARIA DA ADRIANA foi pensada para quem busca comida saborosa, rotina mais leve e atendimento rápido pelo WhatsApp.
+                        A proposta é unir praticidade no pedido, clareza no cardápio e uma experiência mais organizada para entregas e retirada no local.
+                    </p>
+                    <p>
+                        A página pública já fica pronta para apresentar a marca, destacar os horários e servir como ponto de entrada para novos pedidos.
+                    </p>
+                </div>
+            </section>
+
+            <section class="info-section" id="informacoes">
+                <div class="section-heading">
+                    <p class="eyebrow">Informações importantes</p>
+                    <h2>O essencial para orientar o cliente com rapidez</h2>
+                </div>
+                <div class="info-grid">
+                    <article class="info-card">
+                        <span class="info-icon">⏰</span>
+                        <h3>Horário de funcionamento</h3>
+                        <p>Segunda a sábado, com horários de atendimento conforme disponibilidade da marmitaria.</p>
+                    </article>
+                    <article class="info-card">
+                        <span class="info-icon">🍛</span>
+                        <h3>Cardápio</h3>
+                        <p>Cardápio variado com opções de marmitas e pratos do dia.</p>
+                    </article>
+                    <article class="info-card">
+                        <span class="info-icon">🛵</span>
+                        <h3>Entregas</h3>
+                        <p>Entregas e retiradas com praticidade, conforme horário de atendimento.</p>
+                    </article>
+                    <article class="info-card">
+                        <span class="info-icon">📍</span>
+                        <h3>Localização</h3>
+                        <p>Inclua aqui o endereço da Marmitaria da Adriana.</p>
+                    </article>
+                </div>
+            </section>
+
+            <section class="cta-section">
+                <div class="cta-card">
+                    <p class="eyebrow">Faça seu pedido</p>
+                    <h2>Peça sua marmita com praticidade e sabor na Marmitaria da Adriana.</h2>
+                    <div class="cta-actions">
+                        <a
+                            class="button button-primary"
+                            href="https://wa.me/?text=Olá%2C%20quero%20fazer%20um%20pedido%20na%20Marmitaria%20da%20Adriana."
+                            target="_blank"
+                            rel="noopener noreferrer"
+                        >
+                            Pedir pelo WhatsApp
+                        </a>
+                        <a class="button button-secondary" href="/login/">Entrar no painel</a>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        (function () {
+            const carousel = document.querySelector("[data-carousel]");
+            if (!carousel) {
+                return;
+            }
+
+            const slides = Array.from(carousel.querySelectorAll(".carousel-slide"));
+            const dots = Array.from(carousel.querySelectorAll(".carousel-dot"));
+            const nextButton = carousel.querySelector("[data-carousel-next]");
+            const prevButton = carousel.querySelector("[data-carousel-prev]");
+            let activeIndex = 0;
+            let intervalId = null;
+
+            function render(index) {
+                activeIndex = (index + slides.length) % slides.length;
+                slides.forEach((slide, currentIndex) => {
+                    slide.classList.toggle("is-active", currentIndex === activeIndex);
+                });
+                dots.forEach((dot, currentIndex) => {
+                    dot.classList.toggle("is-active", currentIndex === activeIndex);
+                });
+            }
+
+            function startAutoPlay() {
+                intervalId = window.setInterval(function () {
+                    render(activeIndex + 1);
+                }, 5500);
+            }
+
+            function resetAutoPlay() {
+                if (intervalId) {
+                    window.clearInterval(intervalId);
+                }
+                startAutoPlay();
+            }
+
+            nextButton.addEventListener("click", function () {
+                render(activeIndex + 1);
+                resetAutoPlay();
+            });
+
+            prevButton.addEventListener("click", function () {
+                render(activeIndex - 1);
+                resetAutoPlay();
+            });
+
+            dots.forEach((dot, index) => {
+                dot.addEventListener("click", function () {
+                    render(index);
+                    resetAutoPlay();
+                });
+            });
+
+            render(0);
+            startAutoPlay();
+        }());
+    </script>
+</body>
+</html>
