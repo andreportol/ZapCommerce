@@ -455,6 +455,89 @@ class CardapioDayContextTests(SimpleTestCase):
         self.assertEqual(state_after.status_atendimento, AtendimentoStatus.AGUARDANDO_NOME_CLIENTE)
         self.assertEqual(state_after.aguardando_resposta, "nome_cliente")
 
+    def test_beverage_question_during_delivery_choice_keeps_pending_step(self) -> None:
+        telefone = "5511999990030"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+
+        result = self.orchestrator.handle_message("Tem bebidas?", telefone=telefone)
+        state_after = self._store[telefone]
+
+        self.assertIn("bebidas ainda não estão cadastradas no sistema", result["final_response"])
+        self.assertIn("Você prefere:", result["final_response"])
+        self.assertIn("1 - Entrega", result["final_response"])
+        self.assertIn("2 - Retirada no local", result["final_response"])
+        self.assertNotIn("Cardápios disponíveis:", result["final_response"])
+        self.assertNotIn("O cardápio", result["final_response"])
+        self.assertEqual(state_after.status_atendimento, AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
+        self.assertEqual(state_after.aguardando_resposta, "tipo_entrega")
+
+    def test_beverage_question_variant_during_order_does_not_return_to_menu(self) -> None:
+        telefone = "5511999990031"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+
+        result = self.orchestrator.handle_message("Quero saber de bebidas! O que vc tem?", telefone=telefone)
+
+        self.assertIn("bebidas ainda não estão cadastradas no sistema", result["final_response"])
+        self.assertIn("Você prefere:", result["final_response"])
+        self.assertNotIn("Como posso ajudar?", result["final_response"])
+
+    def test_pickup_choice_after_beverage_question_still_works(self) -> None:
+        telefone = "5511999990032"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+        self.orchestrator.handle_message("Tem bebidas?", telefone=telefone)
+
+        result = self.orchestrator.handle_message("2", telefone=telefone)
+        state_after = self._store[telefone]
+
+        self.assertIn("retirada no local", result["final_response"].lower())
+        self.assertEqual(state_after.tipo_entrega, "retirada")
+        self.assertEqual(state_after.status_atendimento, AtendimentoStatus.AGUARDANDO_NOME_CLIENTE)
+
+    def test_beverage_question_during_payment_repeats_payment_step(self) -> None:
+        telefone = "5511999990033"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Uma só", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("André", telefone=telefone)
+
+        result = self.orchestrator.handle_message("Tem bebidas?", telefone=telefone)
+        state_after = self._store[telefone]
+
+        self.assertIn("bebidas ainda não estão cadastradas no sistema", result["final_response"])
+        self.assertIn("Qual será a forma de pagamento?", result["final_response"])
+        self.assertIn("1 - Pix", result["final_response"])
+        self.assertIn("2 - Dinheiro", result["final_response"])
+        self.assertIn("3 - Cartão", result["final_response"])
+        self.assertEqual(state_after.status_atendimento, AtendimentoStatus.AGUARDANDO_PAGAMENTO)
+
+    def test_order_continuation_prompt_uses_correct_accentuation(self) -> None:
+        telefone = "5511999990034"
+        self._store[telefone] = self._FakeState(
+            telefone=telefone,
+            status_atendimento=AtendimentoStatus.AGUARDANDO_CONFIRMACAO,
+            ultima_intencao="fazer_pedido",
+            itens_pedido=[{"produto": "marmitex individual", "quantidade": 1, "subtotal": 21.0}],
+            valor_total=21.0,
+            forma_pagamento="Cartão",
+            tipo_entrega="retirada",
+        )
+
+        result = self.orchestrator._order_continuation_prompt(self._store[telefone])
+
+        self.assertIn("confirme se está tudo certo", result)
+        self.assertNotIn("confirme se esta tudo certo", result)
+
     def test_pickup_flow_asks_name_before_payment(self) -> None:
         telefone = "5511999990043"
 

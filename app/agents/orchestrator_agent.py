@@ -4,6 +4,7 @@ import logging
 import os
 
 from django.conf import settings
+from django.test.testcases import DatabaseOperationForbidden
 from django.utils import timezone
 
 from .base_agent import AgentExecutionError, create_base_agent, run_text
@@ -31,6 +32,8 @@ from app.business_config import (
 from app.order_catalog import format_brl, get_order_product, get_order_product_by_people, get_order_product_choices, list_order_products
 
 logger = logging.getLogger(__name__)
+
+BEBIDAS_DISPONIVEIS: list[str] = []
 
 
 class OrchestratorAgent:
@@ -253,7 +256,7 @@ class OrchestratorAgent:
             previous_status = conversation_state.status_atendimento
             if previous_status != AtendimentoStatus.INICIO:
                 reset_state(phone_key)
-            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            order_data = self._process_order_message(phone_key, "quero fazer pedido")
             prefix = "Certo 😊 Vou iniciar um novo pedido.\n\n"
             if previous_status == AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO:
                 prefix = (
@@ -275,7 +278,7 @@ class OrchestratorAgent:
             conversation_state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO
             and self._is_order_confirmation_from_offer(message)
         ):
-            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            order_data = self._process_order_message(phone_key, "quero fazer pedido")
             response = self._start_order_prompt()
             return {
                 "intent": "fazer_pedido",
@@ -345,6 +348,18 @@ class OrchestratorAgent:
                 rag_snippets=rag_snippets,
                 file_info=file_info,
             )
+
+        parallel_order_info_route = self._route_parallel_order_info_request(
+            message=message,
+            phone_key=phone_key,
+            conversation_state=conversation_state,
+            instructions=instructions,
+            cardapio=cardapio,
+            rag_snippets=rag_snippets,
+            file_info=file_info,
+        )
+        if parallel_order_info_route is not None:
+            return parallel_order_info_route
 
         if main_menu_option:
             main_menu_route = self._route_main_menu_option(
@@ -452,7 +467,7 @@ class OrchestratorAgent:
             }
 
         if analysis.menu_option == "1" and conversation_state.status_atendimento == AtendimentoStatus.INICIO:
-            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            order_data = self._process_order_message(phone_key, "quero fazer pedido")
             return {
                 "intent": "fazer_pedido",
                 "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
@@ -488,7 +503,7 @@ class OrchestratorAgent:
             conversation_state.status_atendimento == AtendimentoStatus.INICIO
             and self._is_explicit_start_order(message)
         ):
-            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            order_data = self._process_order_message(phone_key, "quero fazer pedido")
             return {
                 "intent": "fazer_pedido",
                 "database": {"implemented": False, "message": "Fluxo de pedido em andamento.", "data": None},
@@ -504,7 +519,7 @@ class OrchestratorAgent:
             conversation_state.status_atendimento == AtendimentoStatus.INICIO
             and self._looks_like_additional_request_without_order(message)
         ):
-            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            order_data = self._process_order_message(phone_key, "quero fazer pedido")
             start_prompt = self._start_order_prompt()
             prompt_body = start_prompt.split("\n\n", 1)[1] if "\n\n" in start_prompt else start_prompt
             return {
@@ -554,7 +569,7 @@ class OrchestratorAgent:
                     "final_response": f"O total do seu pedido e {total}.",
                 }
 
-            order_data = self.order_agent.process_message(
+            order_data = self._process_order_message(
                 phone_key,
                 message,
                 structured_analysis=analysis.structured,
@@ -733,7 +748,7 @@ class OrchestratorAgent:
                 forwarded_message = "retirada"
             elif analysis.intencao == "informar_endereco" and analysis.endereco:
                 forwarded_message = f"entrega na {analysis.endereco}"
-            order_data = self.order_agent.process_message(
+            order_data = self._process_order_message(
                 phone_key,
                 forwarded_message,
                 structured_analysis=analysis.structured,
@@ -785,6 +800,11 @@ class OrchestratorAgent:
             "final_response": self._main_menu_response(),
         }
 
+    def _process_order_message(self, telefone: str, message: str, **kwargs) -> dict:
+        order_data = self.order_agent.process_message(telefone, message, **kwargs)
+        self.order_agent.persist_order_snapshot(telefone)
+        return order_data
+
     def _handle_cardapio_quantity_order_followup(
         self,
         message: str,
@@ -804,7 +824,7 @@ class OrchestratorAgent:
             return None
 
         forwarded_message = f"quero {quantity} marmitex"
-        order_data = self.order_agent.process_message(
+        order_data = self._process_order_message(
             phone_key,
             forwarded_message,
             file_name=file_name,
@@ -1128,7 +1148,7 @@ class OrchestratorAgent:
         file_info,
     ) -> dict | None:
         if menu_option == "1":
-            order_data = self.order_agent.process_message(phone_key, "quero fazer pedido")
+            order_data = self._process_order_message(phone_key, "quero fazer pedido")
             return {
                 "intent": "fazer_pedido",
                 "database": {"implemented": False, "message": "Fluxo de pedido iniciado pelo menu principal.", "data": None},
@@ -1230,6 +1250,96 @@ class OrchestratorAgent:
             "file_info": None,
             "final_response": final_response,
         }
+
+    def _route_parallel_order_info_request(
+        self,
+        message: str,
+        phone_key: str,
+        conversation_state,
+        instructions: str,
+        cardapio: str,
+        rag_snippets: list[dict],
+        file_info,
+    ) -> dict | None:
+        if not self._has_active_order_context(conversation_state):
+            return None
+
+        if self._is_beverage_info_request(message):
+            return {
+                "intent": "consultar_bebidas",
+                "database": {"implemented": False, "message": "Consulta de bebidas durante pedido em andamento.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": conversation_state.__dict__,
+                "final_response": self._build_beverage_response_for_order(conversation_state),
+            }
+
+        if self._is_menu_request_during_order(message, conversation_state):
+            cardapio_response = self._build_cardapio_response_for_order(message, cardapio, conversation_state)
+            if conversation_state.status_atendimento in {
+                AtendimentoStatus.AGUARDANDO_PRODUTO,
+                AtendimentoStatus.FAZENDO_PEDIDO,
+                AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO,
+            }:
+                update_state(phone_key, status_atendimento=AtendimentoStatus.AGUARDANDO_PRODUTO)
+            return {
+                "intent": "consultando_cardapio",
+                "database": {"implemented": False, "message": "Consulta local de cardápio durante pedido em andamento.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": get_or_create_state(phone_key).__dict__,
+                "final_response": cardapio_response,
+            }
+
+        info_intent = self._detect_operational_info_intent(message)
+        if info_intent:
+            if info_intent == "horario_funcionamento":
+                final_response = self._build_parallel_order_followup_response(
+                    self._build_business_hours_response(message),
+                    conversation_state,
+                )
+            elif info_intent == "localizacao":
+                final_response = self._build_parallel_order_followup_response(
+                    self._build_location_response(),
+                    conversation_state,
+                )
+            else:
+                final_response = self._build_parallel_order_followup_response(
+                    self._build_general_info_response(),
+                    conversation_state,
+                )
+            return {
+                "intent": info_intent,
+                "database": {"implemented": False, "message": "Resposta informativa paralela durante pedido em andamento.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": conversation_state.__dict__,
+                "final_response": final_response,
+            }
+
+        if self._is_payment_info_request(message):
+            final_response = self._build_parallel_order_followup_response(
+                "Aceitamos Pix, dinheiro e cartão 😊",
+                conversation_state,
+            )
+            return {
+                "intent": "consultar_pagamento",
+                "database": {"implemented": False, "message": "Resposta sobre pagamento durante pedido em andamento.", "data": None},
+                "instructions": instructions,
+                "cardapio_loaded": bool(cardapio),
+                "rag_results": rag_snippets,
+                "file_info": file_info.__dict__ if file_info else None,
+                "order_state": conversation_state.__dict__,
+                "final_response": final_response,
+            }
+
+        return None
 
     def _detect_operational_info_intent(self, message: str) -> str:
         text = self._normalize_short_text(message)
@@ -1492,6 +1602,119 @@ class OrchestratorAgent:
             lines.append(f"{index} - {product['nome']}")
         lines.extend(["", owner_consultation_message()])
         return "\n".join(lines)
+
+    def _list_available_beverages(self) -> list[str]:
+        try:
+            from app.models import Produto
+
+            return list(
+                Produto.objects.filter(
+                    categoria=Produto.Categoria.BEBIDA,
+                    disponivel=True,
+                )
+                .order_by("nome")
+                .values_list("nome", flat=True)
+            )
+        except DatabaseOperationForbidden:
+            return list(BEBIDAS_DISPONIVEIS)
+        except Exception:
+            return list(BEBIDAS_DISPONIVEIS)
+
+    def _is_beverage_info_request(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        if not text:
+            return False
+        markers = [
+            "bebida",
+            "bebidas",
+            "beber",
+            "refrigerante",
+            "refrigerantes",
+            "coca",
+            "guarana",
+            "guaraná",
+            "suco",
+            "agua",
+            "água",
+        ]
+        return any(marker in text for marker in markers)
+
+    def _build_beverage_response_for_order(self, state) -> str:
+        bebidas = self._list_available_beverages()
+        continuation = self._pending_order_step_prompt(state)
+        if bebidas:
+            lines = ["Temos bebidas sim 😊", "", "No momento, estas são as opções disponíveis:"]
+            for index, bebida in enumerate(bebidas, start=1):
+                lines.append(f"{index} - {bebida}")
+            lines.extend(["", "Deseja adicionar alguma bebida ao seu pedido?"])
+            if continuation:
+                lines.extend(["", "Ou, se preferir, podemos continuar:", "", continuation])
+            return "\n".join(lines)
+
+        lines = [
+            "No momento as bebidas ainda não estão cadastradas no sistema 😊",
+            "",
+            "Posso continuar seu pedido normalmente.",
+        ]
+        if continuation:
+            lines.extend(["", continuation])
+        return "\n".join(lines)
+
+    def _build_parallel_order_followup_response(self, info_response: str, state) -> str:
+        continuation = self._pending_order_step_prompt(state)
+        if not continuation:
+            return info_response
+        return f"{info_response}\n\nPara continuar seu pedido:\n\n{continuation}"
+
+    def _pending_order_step_prompt(self, state) -> str:
+        status = getattr(state, "status_atendimento", "")
+        if status == AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA:
+            return self.order_agent._delivery_mode_prompt()
+        if status == AtendimentoStatus.AGUARDANDO_ENDERECO:
+            return self.order_agent._delivery_address_prompt()
+        if status == AtendimentoStatus.AGUARDANDO_NOME_CLIENTE:
+            return self.order_agent._customer_name_prompt()
+        if status == AtendimentoStatus.AGUARDANDO_PAGAMENTO:
+            return self.order_agent._payment_options_prompt()
+        if status == AtendimentoStatus.AGUARDANDO_COMPROVANTE:
+            return "Pode enviar o comprovante por aqui quando quiser."
+        if status == AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO:
+            return "Seu comprovante já foi recebido e está aguardando conferência."
+        if status == AtendimentoStatus.AGUARDANDO_CONFIRMACAO:
+            return self.order_agent._build_order_summary(state)
+        if status == AtendimentoStatus.AGUARDANDO_QUANTIDADE:
+            return "Qual a quantidade desejada?"
+        if status == AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA:
+            return "Essa marmita é para quantas pessoas?"
+        if status in {
+            AtendimentoStatus.FAZENDO_PEDIDO,
+            AtendimentoStatus.AGUARDANDO_PRODUTO,
+            AtendimentoStatus.AGUARDANDO_CONFIRMACAO_FAZER_PEDIDO,
+        }:
+            return self._start_order_prompt()
+        return self._order_continuation_prompt(state)
+
+    def _is_payment_info_request(self, message: str) -> bool:
+        text = self._normalize_short_text(message)
+        if not text:
+            return False
+        return any(
+            term in text
+            for term in [
+                "forma de pagamento",
+                "formas de pagamento",
+                "como paga",
+                "como pagar",
+                "aceita pix",
+                "aceita cartao",
+                "aceita cartão",
+                "aceita dinheiro",
+                "pagamento",
+                "pix",
+                "cartao",
+                "cartão",
+            ]
+        )
 
     def _maybe_mark_awaiting_order_confirmation(self, telefone: str, response: str) -> None:
         text = (response or "").lower()
@@ -1984,10 +2207,10 @@ class OrchestratorAgent:
         if not available_products:
             return "No momento não há opções de pedido disponíveis no catálogo."
 
-        response_lines = ["Nossos valores sao:", ""]
+        response_lines = ["Nossos valores são:", ""]
         for product in available_products:
             response_lines.append(f"* {product['nome']}: {format_brl(product['preco'])}")
-        response_lines.extend(["", owner_consultation_message().replace('proprietária', 'proprietaria')])
+        response_lines.extend(["", owner_consultation_message()])
         return "\n".join(response_lines)
 
     def _is_price_followup_context(self, message: str, state) -> bool:
@@ -2301,7 +2524,7 @@ class OrchestratorAgent:
             return "Agora, para continuar seu pedido, pode enviar o comprovante por aqui."
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO:
             return "Seu comprovante já foi recebido e está aguardando conferência."
-        return "Agora, para continuar seu pedido, confirme se esta tudo certo, por favor."
+        return "Agora, para continuar seu pedido, confirme se está tudo certo, por favor."
 
     def _handle_menu_option(self, menu_option: str) -> str:
         if menu_option == "1":
@@ -2398,7 +2621,7 @@ class OrchestratorAgent:
             )
         if intent == "atendimento humano":
             return "Entendi. Vou encaminhar seu atendimento para uma pessoa da equipe."
-        return "Posso te ajudar melhor se voce me contar mais detalhes do que precisa."
+        return "Posso te ajudar melhor se você me contar mais detalhes do que precisa."
 
     def _response_from_rag_rules(self, message: str, cardapio: str, rag_snippets: list[dict]) -> str:
         msg = message.lower()
@@ -2413,7 +2636,7 @@ class OrchestratorAgent:
         if people_count is not None:
             if people_count > 5:
                 if "acima de 5 pessoas" in rag_text or "mais de 5 pessoas" in rag_text:
-                    return owner_consultation_message().replace('proprietária', 'proprietaria')
+                    return owner_consultation_message()
             if 2 <= people_count <= 5:
                 value = self._extract_price_for_people(rag_text, people_count)
                 if value:
@@ -2428,8 +2651,8 @@ class OrchestratorAgent:
                 day = self._current_weekday_ptbr()
             day_menu = self._extract_day_menu(cardapio, day)
             if day_menu:
-                return f"Considerando {day}, o cardapio e:\n{day_menu}"
-            return "Para eu te informar certinho, pode confirmar qual dia da semana voce quer consultar?"
+                return f"Considerando {self._display_weekday(day)}, o cardápio é:\n{day_menu}"
+            return "Para eu te informar certinho, pode confirmar qual dia da semana você quer consultar?"
 
         return ""
 

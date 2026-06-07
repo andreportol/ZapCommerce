@@ -1,6 +1,10 @@
+import logging
 import re
 import unicodedata
 from dataclasses import asdict
+from decimal import Decimal
+
+from django.test.testcases import DatabaseOperationForbidden
 
 from app.business_config import (
     current_weekday_key,
@@ -31,12 +35,156 @@ NUMBER_WORDS = {
     "dez": 10,
 }
 
+logger = logging.getLogger(__name__)
+
 
 class OrderAgent:
     """Controla montagem de pedido durante a conversa."""
 
     def __init__(self) -> None:
         self.payment_proof_agent = PaymentProofAgent()
+
+    def persist_order_snapshot(self, telefone: str, mark_cancelled: bool = False) -> None:
+        try:
+            from django.db import transaction
+
+            from app.models import Cliente, Conversa, ItemPedido, Pedido
+
+            state = get_or_create_state(telefone)
+            cliente, _ = Cliente.objects.get_or_create(telefone=telefone)
+            customer_name = self._get_customer_name(telefone)
+            if customer_name and cliente.nome != customer_name:
+                cliente.nome = customer_name
+                cliente.save(update_fields=["nome", "atualizado_em"])
+
+            conversa = (
+                Conversa.objects.filter(cliente=cliente)
+                .exclude(status=Conversa.Status.FINALIZADA)
+                .order_by("-atualizado_em")
+                .first()
+            )
+            if conversa is None:
+                conversa = Conversa.objects.create(cliente=cliente, status=Conversa.Status.IA)
+
+            pedido = (
+                Pedido.objects.filter(conversa=conversa)
+                .exclude(status__in=[Pedido.Status.ENTREGUE, Pedido.Status.CANCELADO])
+                .order_by("-criado_em")
+                .first()
+            )
+
+            if mark_cancelled:
+                if pedido is not None:
+                    pedido.status = Pedido.Status.CANCELADO
+                    pedido.save(update_fields=["status", "atualizado_em"])
+                return
+
+            has_order_payload = bool(
+                state.itens_pedido or state.produto or state.quantidade or state.valor_total or state.forma_pagamento
+            )
+            if not has_order_payload:
+                return
+
+            if pedido is None:
+                pedido = Pedido.objects.create(cliente=cliente, conversa=conversa, status=Pedido.Status.RASCUNHO)
+
+            computed_status = self._db_status_from_state(state)
+            pedido.forma_pagamento = self._db_payment_value(state.forma_pagamento)
+            pedido.endereco_entrega = state.endereco if state.tipo_entrega == "entrega" else ""
+            pedido.observacoes = self._build_db_order_notes(state)
+            pedido.subtotal = Decimal(str(state.valor_total or 0.0))
+            pedido.total = Decimal(str(state.valor_total or 0.0))
+            pedido.taxa_entrega = Decimal("0.00")
+            pedido.status = self._preserve_advanced_db_status(pedido.status, computed_status)
+
+            with transaction.atomic():
+                pedido.save(
+                    update_fields=[
+                        "forma_pagamento",
+                        "endereco_entrega",
+                        "observacoes",
+                        "subtotal",
+                        "total",
+                        "taxa_entrega",
+                        "status",
+                        "atualizado_em",
+                    ]
+                )
+                ItemPedido.objects.filter(pedido=pedido).delete()
+                for item in self._items_for_persistence(state):
+                    catalog_item = get_order_product(item["produto_key"], only_available=False)
+                    if not catalog_item or not catalog_item.get("produto"):
+                        continue
+                    produto = catalog_item["produto"]
+                    quantidade = max(1, int(item["quantidade"]))
+                    preco_unitario = Decimal(str(item["valor_unitario"]))
+                    subtotal = Decimal(str(item["subtotal"]))
+                    ItemPedido.objects.create(
+                        pedido=pedido,
+                        produto=produto,
+                        quantidade=quantidade,
+                        preco_unitario=preco_unitario,
+                        subtotal=subtotal,
+                    )
+        except DatabaseOperationForbidden:
+            logger.debug(
+                "Persistência do pedido ignorada por ambiente de teste sem acesso ao banco telefone=%s",
+                telefone,
+            )
+        except Exception:
+            logger.exception("Falha ao persistir snapshot do pedido telefone=%s", telefone)
+
+    def _items_for_persistence(self, state) -> list[dict]:
+        if state.itens_pedido:
+            return list(state.itens_pedido)
+        if state.produto and state.quantidade and state.valor_total:
+            item = self._make_item_from_key(state.produto, int(state.quantidade or 1))
+            return [item] if item else []
+        return []
+
+    def _db_payment_value(self, payment_label: str) -> str:
+        normalized = self._normalize(payment_label)
+        if normalized == "pix":
+            return "pix"
+        if normalized == "dinheiro":
+            return "dinheiro"
+        if normalized == "cartao":
+            return "cartao_entrega"
+        return ""
+
+    def _db_status_from_state(self, state) -> str:
+        if state.status_atendimento in {
+            AtendimentoStatus.AGUARDANDO_COMPROVANTE,
+            AtendimentoStatus.AGUARDANDO_CONFERENCIA_PAGAMENTO,
+        }:
+            return "aguardando_pagamento"
+        if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO:
+            return "aguardando_confirmacao"
+        if state.forma_pagamento == "Pix":
+            return "aguardando_pagamento"
+        if state.forma_pagamento in {"Dinheiro", "Cartão"}:
+            return "aguardando_confirmacao"
+        return "rascunho"
+
+    def _preserve_advanced_db_status(self, current_status: str, computed_status: str) -> str:
+        if current_status in {"em_preparo", "saiu_para_entrega", "entregue"}:
+            return current_status
+        return computed_status
+
+    def _build_db_order_notes(self, state) -> str:
+        notes: list[str] = []
+        customer_name = self._get_customer_name(state.telefone)
+        if state.tipo_entrega == "retirada":
+            notes.append("Forma de recebimento: retirada no local")
+        elif state.tipo_entrega == "entrega":
+            notes.append("Forma de recebimento: entrega")
+        if customer_name:
+            notes.append(f"Nome: {customer_name}")
+        for item in state.itens_pedido or []:
+            observation = (item.get("observacao") or "").strip()
+            if observation:
+                notes.append(f"Observação: {observation}")
+        return "\n".join(notes)
 
     def _business_settings(self):
         return get_active_business_settings()
@@ -364,6 +512,7 @@ class OrderAgent:
         in_order = state.ultima_intencao == "fazer_pedido" or state.status_atendimento != AtendimentoStatus.INICIO
 
         if self._is_cancel_request(normalized):
+            self.persist_order_snapshot(telefone, mark_cancelled=True)
             reset_state(telefone)
             return {
                 "state": asdict(get_or_create_state(telefone)),
@@ -528,6 +677,7 @@ class OrderAgent:
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO:
             if self._is_cancel_request(normalized):
+                self.persist_order_snapshot(telefone, mark_cancelled=True)
                 reset_state(telefone)
                 return {
                     "state": asdict(get_or_create_state(telefone)),
@@ -579,6 +729,7 @@ class OrderAgent:
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA:
             if self._is_cancel_request(normalized):
+                self.persist_order_snapshot(telefone, mark_cancelled=True)
                 reset_state(telefone)
                 return {
                     "state": asdict(get_or_create_state(telefone)),

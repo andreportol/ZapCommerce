@@ -6,7 +6,7 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView, LogoutView
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse, reverse_lazy
@@ -165,10 +165,33 @@ class DashboardView(LoginRequiredMixin, TemplateView):
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         today = timezone.localdate()
+        open_statuses = [
+            Pedido.Status.RASCUNHO,
+            Pedido.Status.AGUARDANDO_CONFIRMACAO,
+            Pedido.Status.AGUARDANDO_PAGAMENTO,
+            Pedido.Status.PAGO,
+            Pedido.Status.EM_PREPARO,
+            Pedido.Status.SAIU_PARA_ENTREGA,
+        ]
         pedidos_hoje = (
             Pedido.objects.filter(criado_em__date=today)
             .select_related('cliente')
             .order_by('-criado_em')
+        )
+        pedidos_operacao = (
+            Pedido.objects.filter(
+                Q(criado_em__date=today)
+                | Q(atualizado_em__date=today)
+                | Q(status__in=open_statuses)
+            )
+            .select_related('cliente')
+            .distinct()
+            .order_by('-atualizado_em', '-criado_em')
+        )
+        pedidos_finalizados_hoje = Pedido.objects.filter(
+            status=Pedido.Status.ENTREGUE,
+        ).filter(
+            Q(criado_em__date=today) | Q(atualizado_em__date=today)
         )
         faturamento = (
             pedidos_hoje.exclude(status=Pedido.Status.CANCELADO)
@@ -185,11 +208,11 @@ class DashboardView(LoginRequiredMixin, TemplateView):
             for status_value, _label, _description, tone in self.STATUS_META
         }
         status_counts = {
-            status_value: pedidos_hoje.filter(status=status_value).count()
+            status_value: pedidos_operacao.filter(status=status_value).count()
             for status_value, _label, _description, _tone in self.STATUS_META
         }
         recent_orders = []
-        for pedido in pedidos_hoje[:10]:
+        for pedido in pedidos_operacao[:10]:
             cliente_nome = (pedido.cliente.nome or '').strip() or pedido.cliente.telefone
             recent_orders.append(
                 {
@@ -215,7 +238,7 @@ class DashboardView(LoginRequiredMixin, TemplateView):
                     },
                     {
                         'label': 'Pedidos pendentes',
-                        'value': pedidos_hoje.filter(
+                        'value': pedidos_operacao.filter(
                             status__in=[
                                 Pedido.Status.RASCUNHO,
                                 Pedido.Status.AGUARDANDO_CONFIRMACAO,
@@ -223,17 +246,17 @@ class DashboardView(LoginRequiredMixin, TemplateView):
                                 Pedido.Status.PAGO,
                             ]
                         ).count(),
-                        'description': 'Aguardando confirmação, pagamento ou início de preparo',
+                        'description': 'Pedidos ativos aguardando confirmação, pagamento ou início de preparo',
                     },
                     {
                         'label': 'Pedidos em preparo',
-                        'value': pedidos_hoje.filter(status=Pedido.Status.EM_PREPARO).count(),
-                        'description': 'Pedidos atualmente em produção',
+                        'value': pedidos_operacao.filter(status=Pedido.Status.EM_PREPARO).count(),
+                        'description': 'Pedidos ativos atualmente em produção',
                     },
                     {
                         'label': 'Pedidos finalizados',
-                        'value': pedidos_hoje.filter(status=Pedido.Status.ENTREGUE).count(),
-                        'description': 'Pedidos entregues hoje',
+                        'value': pedidos_finalizados_hoje.count(),
+                        'description': 'Pedidos entregues e concluídos hoje',
                     },
                     {
                         'label': 'Faturamento do dia',
