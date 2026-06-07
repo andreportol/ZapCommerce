@@ -118,6 +118,9 @@ class MessageAgent:
         pending_responses = {
             "tipo_marmita",
             "quantidade",
+            "complemento",
+            "quantidade_complemento",
+            "mais_complementos",
             "tipo_entrega",
             "endereco",
             "nome_cliente",
@@ -366,7 +369,16 @@ class MessageAgent:
         has_active_order_data = bool(
             state_summary.get("ultima_intencao") == "fazer_pedido"
             or state_summary.get("status_atendimento") not in {"", "inicio"}
-            or state_summary.get("aguardando_resposta") in {"quantidade", "tipo_entrega", "endereco", "nome_cliente", "forma_pagamento"}
+            or state_summary.get("aguardando_resposta") in {
+                "quantidade",
+                "complemento",
+                "quantidade_complemento",
+                "mais_complementos",
+                "tipo_entrega",
+                "endereco",
+                "nome_cliente",
+                "forma_pagamento",
+            }
             or pedido_atual.get("produto")
             or pedido_atual.get("quantidade")
             or pedido_atual.get("tipo_entrega")

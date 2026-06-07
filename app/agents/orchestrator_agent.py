@@ -1083,6 +1083,9 @@ class OrchestratorAgent:
             "produto",
             "tipo_marmita",
             "quantidade",
+            "complemento",
+            "quantidade_complemento",
+            "mais_complementos",
             "tipo_entrega",
             "endereco",
             "nome_cliente",
@@ -1264,7 +1267,11 @@ class OrchestratorAgent:
         if not self._has_active_order_context(conversation_state):
             return None
 
-        if self._is_beverage_info_request(message):
+        if self._is_beverage_info_request(message) and getattr(conversation_state, "aguardando_resposta", "") not in {
+            "complemento",
+            "quantidade_complemento",
+            "mais_complementos",
+        }:
             return {
                 "intent": "consultar_bebidas",
                 "database": {"implemented": False, "message": "Consulta de bebidas durante pedido em andamento.", "data": None},
@@ -1668,6 +1675,16 @@ class OrchestratorAgent:
 
     def _pending_order_step_prompt(self, state) -> str:
         status = getattr(state, "status_atendimento", "")
+        waiting = getattr(state, "aguardando_resposta", "")
+        if waiting == "complemento":
+            return self.order_agent._complement_prompt()
+        if waiting == "quantidade_complemento":
+            pending_option = self.order_agent._find_pending_complement(state)
+            if pending_option is not None:
+                return self.order_agent._prompt_complement_quantity(pending_option)
+            return self.order_agent._complement_prompt()
+        if waiting == "mais_complementos":
+            return self.order_agent._more_complements_prompt()
         if status == AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA:
             return self.order_agent._delivery_mode_prompt()
         if status == AtendimentoStatus.AGUARDANDO_ENDERECO:
@@ -1801,6 +1818,9 @@ class OrchestratorAgent:
             or getattr(state, "aguardando_resposta", "") in {
                 "tipo_marmita",
                 "quantidade",
+                "complemento",
+                "quantidade_complemento",
+                "mais_complementos",
                 "tipo_entrega",
                 "endereco",
                 "nome_cliente",
@@ -2514,6 +2534,12 @@ class OrchestratorAgent:
             return "Agora, para continuar seu pedido, você deseja marmitex individual ou marmita para quantas pessoas?"
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_PESSOAS_MARMITA:
             return "Agora, para continuar seu pedido, me diga para quantas pessoas e a marmita."
+        if state.aguardando_resposta == "complemento":
+            return "Agora, para continuar seu pedido, escolha se deseja adicionar alguma bebida, sobremesa ou adicional."
+        if state.aguardando_resposta == "quantidade_complemento":
+            return "Agora, para continuar seu pedido, me informe a quantidade do complemento."
+        if state.aguardando_resposta == "mais_complementos":
+            return "Agora, para continuar seu pedido, me diga se quer mais algum complemento ou se posso seguir."
         if not state.tipo_entrega:
             return "Agora, para continuar seu pedido, você prefere entrega ou retirada no local?"
         if state.tipo_entrega == "entrega" and not state.endereco:

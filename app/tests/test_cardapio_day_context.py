@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
@@ -11,6 +14,10 @@ import app.services as services_module
 
 
 class CardapioDayContextTests(SimpleTestCase):
+    class _FakeQueryset(list):
+        def order_by(self, *_args, **_kwargs):
+            return self
+
     @dataclass
     class _FakeState:
         telefone: str
@@ -51,6 +58,7 @@ class CardapioDayContextTests(SimpleTestCase):
         self._original_order_get_order_product_choices = order_module.get_order_product_choices
         self._original_order_list_order_products = order_module.list_order_products
         self._original_order_format_brl = order_module.format_brl
+        self._original_list_available_complements = order_module.OrderAgent._list_available_complements
         self._original_service_handle_message = services_module.orchestrator_agent.handle_message
         self._mount_fake_runtime()
 
@@ -93,6 +101,7 @@ class CardapioDayContextTests(SimpleTestCase):
         order_module.get_order_product_choices = self._original_order_get_order_product_choices
         order_module.list_order_products = self._original_order_list_order_products
         order_module.format_brl = self._original_order_format_brl
+        order_module.OrderAgent._list_available_complements = self._original_list_available_complements
         services_module.orchestrator_agent.handle_message = self._original_service_handle_message
         order_module.OrderAgent._get_customer_name = self._original_order_get_customer_name
         order_module.OrderAgent._set_customer_name = self._original_order_set_customer_name
@@ -408,6 +417,169 @@ class CardapioDayContextTests(SimpleTestCase):
         result = self.orchestrator.handle_message("quero 2 marmitex", telefone="5511999990020")
         self.assertIn("Seu pedido ficou assim", result["final_response"])
 
+    def test_order_offers_complements_before_delivery_choice(self) -> None:
+        telefone = "5511999990061"
+        self._enable_fake_complements()
+
+        result = self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Deseja adicionar alguma bebida ou complemento?", result["final_response"])
+        self.assertIn("1 - Água mineral: R$ 4,00", result["final_response"])
+        self.assertIn("2 - Refrigerante lata: R$ 6,00", result["final_response"])
+        self.assertIn("3 - Ovo adicional: R$ 2,50", result["final_response"])
+        self.assertIn("5 - Não, obrigado", result["final_response"])
+        self.assertNotIn("Você prefere:", result["final_response"])
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
+        self.assertEqual(state.aguardando_resposta, "complemento")
+
+    def test_active_dessert_without_price_is_not_listed_as_complement(self) -> None:
+        fake_products = self._FakeQueryset(
+            [
+                SimpleNamespace(id=101, nome="Água mineral", preco=Decimal("4.00"), categoria="bebida"),
+                SimpleNamespace(id=104, nome="Sobremesa do dia", preco=None, categoria="sobremesa"),
+                SimpleNamespace(id=105, nome="Ovo adicional", preco=Decimal("2.50"), categoria="adicional"),
+            ]
+        )
+
+        with patch("app.models.Produto.objects.filter", return_value=fake_products):
+            options = self.orchestrator.order_agent._list_available_complements()
+
+        product_names = [item["produto"] for item in options]
+        self.assertIn("água mineral", product_names)
+        self.assertIn("ovo adicional", product_names)
+        self.assertNotIn("sobremesa do dia", product_names)
+
+    def test_order_accepts_natural_language_complement_and_then_quantity(self) -> None:
+        telefone = "5511999990062"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+
+        updated = self.orchestrator.handle_message("quero uma água", telefone=telefone)
+        state_after_qty = self._store[telefone]
+        self.assertIn("Atualizei seu pedido", updated["final_response"])
+        self.assertIn("* 2 marmitex individuais: R$ 42,00", updated["final_response"])
+        self.assertIn("* 1 água mineral: R$ 4,00", updated["final_response"])
+        self.assertIn("Total: R$ 46,00", updated["final_response"])
+        self.assertIn("Deseja adicionar mais algum item?", updated["final_response"])
+        self.assertEqual(state_after_qty.aguardando_resposta, "mais_complementos")
+
+    def test_order_can_skip_complements_and_continue_to_delivery(self) -> None:
+        telefone = "5511999990063"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+
+        result = self.orchestrator.handle_message("não quero", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Você prefere:", result["final_response"])
+        self.assertIn("1 - Entrega", result["final_response"])
+        self.assertIn("2 - Retirada no local", result["final_response"])
+        self.assertEqual(state.aguardando_resposta, "tipo_entrega")
+
+    def test_order_accepts_direct_complement_with_quantity_in_text(self) -> None:
+        telefone = "5511999990064"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+
+        updated = self.orchestrator.handle_message("quero 2 ovos adicionais", telefone=telefone)
+        self.assertIn("* 2 marmitex individuais: R$ 42,00", updated["final_response"])
+        self.assertIn("* 2 ovos adicionais: R$ 5,00", updated["final_response"])
+        self.assertIn("Total: R$ 47,00", updated["final_response"])
+        self.assertIn("Deseja adicionar mais algum item?", updated["final_response"])
+
+        finish = self.orchestrator.handle_message("pode seguir", telefone=telefone)
+        state = self._store[telefone]
+        self.assertIn("Você prefere:", finish["final_response"])
+        self.assertEqual(state.aguardando_resposta, "tipo_entrega")
+
+    def test_order_accepts_two_soft_drinks_and_recalculates_total(self) -> None:
+        telefone = "5511999990065"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+        updated = self.orchestrator.handle_message("quero 2 refrigerantes", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("* 2 marmitex individuais: R$ 42,00", updated["final_response"])
+        self.assertIn("* 2 refrigerante lata: R$ 12,00", updated["final_response"])
+        self.assertIn("Total: R$ 54,00", updated["final_response"])
+        self.assertIn("Deseja adicionar mais algum item?", updated["final_response"])
+        self.assertEqual(state.aguardando_resposta, "mais_complementos")
+
+    def test_family_marmita_accepts_two_extra_eggs_and_recalculates_total(self) -> None:
+        telefone = "5511999990066"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 1 marmita para 3 pessoas", telefone=telefone)
+        updated = self.orchestrator.handle_message("quero 2 ovos adicionais", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("* 1 marmita para 3 pessoas: R$ 60,00", updated["final_response"])
+        self.assertIn("* 2 ovos adicionais: R$ 5,00", updated["final_response"])
+        self.assertIn("Total: R$ 65,00", updated["final_response"])
+        self.assertIn("Deseja adicionar mais algum item?", updated["final_response"])
+        self.assertEqual(state.aguardando_resposta, "mais_complementos")
+
+    def test_order_after_complement_can_follow_to_delivery(self) -> None:
+        telefone = "5511999990067"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+        self.orchestrator.handle_message("quero uma água", telefone=telefone)
+        result = self.orchestrator.handle_message("não quero mais nada", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Você prefere:", result["final_response"])
+        self.assertIn("1 - Entrega", result["final_response"])
+        self.assertIn("2 - Retirada no local", result["final_response"])
+        self.assertEqual(state.aguardando_resposta, "tipo_entrega")
+
+    def test_complement_step_numeric_one_selects_first_complement(self) -> None:
+        telefone = "5511999990068"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+        result = self.orchestrator.handle_message("1", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Qual quantidade de água mineral você deseja adicionar?", result["final_response"])
+        self.assertNotIn("Como posso ajudar?", result["final_response"])
+        self.assertEqual(state.aguardando_resposta, "quantidade_complemento")
+
+    def test_complement_step_numeric_two_selects_second_complement(self) -> None:
+        telefone = "5511999990069"
+        self._enable_fake_complements()
+
+        self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+        result = self.orchestrator.handle_message("2", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Qual quantidade de refrigerante lata você deseja adicionar?", result["final_response"])
+        self.assertNotIn("retirada no local", result["final_response"].lower())
+        self.assertEqual(state.aguardando_resposta, "quantidade_complemento")
+
+    def test_complement_step_skip_phrases_continue_to_delivery(self) -> None:
+        self._enable_fake_complements()
+
+        scenarios = [
+            ("5511999990070", "pode seguir"),
+            ("5511999990071", "sem bebida"),
+        ]
+        for telefone, message in scenarios:
+            with self.subTest(message=message):
+                self.orchestrator.handle_message("quero 2 marmitex", telefone=telefone)
+                result = self.orchestrator.handle_message(message, telefone=telefone)
+                state = self._store[telefone]
+
+                self.assertIn("Você prefere:", result["final_response"])
+                self.assertIn("1 - Entrega", result["final_response"])
+                self.assertIn("2 - Retirada no local", result["final_response"])
+                self.assertEqual(state.aguardando_resposta, "tipo_entrega")
+
     def test_order_quantity_message_preserves_additional_observation(self) -> None:
         telefone = "5511999990027"
 
@@ -709,6 +881,23 @@ class CardapioDayContextTests(SimpleTestCase):
         self.assertEqual(state.forma_pagamento, "Pix")
         self.assertEqual(state.status_atendimento, AtendimentoStatus.AGUARDANDO_COMPROVANTE)
 
+    def test_cash_payment_flow_still_reaches_order_confirmation(self) -> None:
+        telefone = "5511999990072"
+
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("1", telefone=telefone)
+        self.orchestrator.handle_message("Duas", telefone=telefone)
+        self.orchestrator.handle_message("2", telefone=telefone)
+        self.orchestrator.handle_message("André", telefone=telefone)
+        result = self.orchestrator.handle_message("2", telefone=telefone)
+        state = self._store[telefone]
+
+        self.assertIn("Resumo do seu pedido:", result["final_response"])
+        self.assertIn("Forma de pagamento: Dinheiro", result["final_response"])
+        self.assertIn("Posso seguir com esse pedido?", result["final_response"])
+        self.assertEqual(state.forma_pagamento, "Dinheiro")
+        self.assertEqual(state.status_atendimento, AtendimentoStatus.AGUARDANDO_CONFIRMACAO)
+
     def test_receipt_pending_ok_returns_short_response(self) -> None:
         telefone = "5511999990040"
 
@@ -884,6 +1073,15 @@ class CardapioDayContextTests(SimpleTestCase):
 
         order_module.OrderAgent._get_customer_name = _get_customer_name
         order_module.OrderAgent._set_customer_name = _set_customer_name
+
+    def _enable_fake_complements(self) -> None:
+        fake_complements = [
+            {"choice": "1", "produto": "água mineral", "produto_key": "complemento_101", "produto_id": 101, "valor_unitario": 4.0, "categoria": "bebida"},
+            {"choice": "2", "produto": "refrigerante lata", "produto_key": "complemento_102", "produto_id": 102, "valor_unitario": 6.0, "categoria": "bebida"},
+            {"choice": "3", "produto": "ovo adicional", "produto_key": "complemento_103", "produto_id": 103, "valor_unitario": 2.5, "categoria": "adicional"},
+            {"choice": "4", "produto": "sobremesa do dia", "produto_key": "complemento_104", "produto_id": 104, "valor_unitario": 7.0, "categoria": "sobremesa"},
+        ]
+        order_module.OrderAgent._list_available_complements = lambda _self: list(fake_complements)
 
     def _configure_outside_hours(self) -> None:
         self.orchestrator._is_open_for_orders = lambda: False

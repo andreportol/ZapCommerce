@@ -48,7 +48,7 @@ class OrderAgent:
         try:
             from django.db import transaction
 
-            from app.models import Cliente, Conversa, ItemPedido, Pedido
+            from app.models import Cliente, Conversa, ItemPedido, Pedido, Produto
 
             state = get_or_create_state(telefone)
             cliente, _ = Cliente.objects.get_or_create(telefone=telefone)
@@ -112,10 +112,16 @@ class OrderAgent:
                 )
                 ItemPedido.objects.filter(pedido=pedido).delete()
                 for item in self._items_for_persistence(state):
-                    catalog_item = get_order_product(item["produto_key"], only_available=False)
-                    if not catalog_item or not catalog_item.get("produto"):
+                    produto = None
+                    produto_id = item.get("produto_id")
+                    if produto_id:
+                        produto = Produto.objects.filter(pk=produto_id).first()
+                    if produto is None:
+                        catalog_item = get_order_product(item["produto_key"], only_available=False)
+                        if catalog_item and catalog_item.get("produto"):
+                            produto = catalog_item["produto"]
+                    if produto is None:
                         continue
-                    produto = catalog_item["produto"]
                     quantidade = max(1, int(item["quantidade"]))
                     preco_unitario = Decimal(str(item["valor_unitario"]))
                     subtotal = Decimal(str(item["subtotal"]))
@@ -229,6 +235,230 @@ class OrderAgent:
         if pickup_text:
             return f"Hoje, {day_label}, retiradas acontecem {pickup_text}."
         return f"Hoje, {day_label}, entregas e retiradas estão indisponíveis."
+
+    def _list_available_complements(self) -> list[dict]:
+        try:
+            from app.models import Produto
+
+            queryset = (
+                Produto.objects.filter(
+                    categoria__in=[
+                        Produto.Categoria.BEBIDA,
+                        Produto.Categoria.ADICIONAL,
+                        Produto.Categoria.SOBREMESA,
+                    ],
+                    disponivel=True,
+                )
+                .order_by("categoria", "nome")
+            )
+            options: list[dict] = []
+            for index, produto in enumerate(queryset, start=1):
+                if produto.preco is None or produto.preco <= 0:
+                    continue
+                options.append(
+                    {
+                        "choice": str(index),
+                        "produto": (produto.nome or "").strip().lower(),
+                        "produto_key": f"complemento_{produto.id}",
+                        "produto_id": produto.id,
+                        "valor_unitario": float(produto.preco),
+                        "categoria": produto.categoria,
+                    }
+                )
+            return options
+        except DatabaseOperationForbidden:
+            return []
+        except Exception:
+            logger.exception("Falha ao listar complementos disponíveis.")
+            return []
+
+    def _complement_skip_choice(self, options: list[dict]) -> str:
+        return str(len(options) + 1)
+
+    def _complement_prompt(self) -> str:
+        options = self._list_available_complements()
+        if not options:
+            return self._delivery_mode_prompt()
+
+        lines = ["Deseja adicionar alguma bebida ou complemento?", ""]
+        for option in options:
+            lines.append(
+                f"{option['choice']} - {option['produto'].capitalize()}: {format_brl(option['valor_unitario'])}"
+            )
+        lines.append(f"{self._complement_skip_choice(options)} - Não, obrigado")
+        return "\n".join(lines)
+
+    def _more_complements_prompt(self) -> str:
+        return "Deseja adicionar mais algum item?\n\n1 - Sim\n2 - Não, seguir pedido"
+
+    def _is_negative_complement_answer(self, normalized_text: str, skip_choice: str = "") -> bool:
+        if skip_choice and normalized_text == skip_choice:
+            return True
+        return any(
+            marker in normalized_text
+            for marker in [
+                "nao",
+                "nao quero",
+                "nao obrigado",
+                "nao obrigada",
+                "sem bebida",
+                "sem sobremesa",
+                "sem adicional",
+                "sem complemento",
+                "sem mais",
+                "pode seguir",
+                "seguir pedido",
+                "seguir",
+                "sem nada",
+            ]
+        )
+
+    def _is_positive_more_complements_answer(self, normalized_text: str) -> bool:
+        return normalized_text in {
+            "1",
+            "sim",
+            "quero",
+            "quero sim",
+            "mais um",
+            "mais uma",
+            "adiciona",
+            "adicionar",
+        }
+
+    def _find_pending_complement(self, state) -> dict | None:
+        for item in state.itens_pendentes or []:
+            if item.get("produto_key", "").startswith("complemento_"):
+                return item
+        return None
+
+    def _extract_complement_choice(self, normalized_text: str, options: list[dict]) -> dict | None:
+        if not normalized_text:
+            return None
+
+        selected_choice = next((item for item in options if item["choice"] == normalized_text), None)
+        if selected_choice is not None:
+            return selected_choice
+
+        full_name_matches = [
+            option
+            for option in options
+            if self._normalize(option["produto"]) in normalized_text
+        ]
+        if full_name_matches:
+            return max(full_name_matches, key=lambda item: len(item["produto"]))
+
+        ignored_tokens = {"de", "do", "da", "das", "dos", "e", "com", "sem", "para", "lata", "mineral", "dia", "adicional"}
+        token_matches: list[tuple[int, dict]] = []
+        for option in options:
+            significant_tokens = [
+                token
+                for token in self._normalize(option["produto"]).split()
+                if len(token) >= 3 and token not in ignored_tokens
+            ]
+            for token in significant_tokens:
+                if token in normalized_text:
+                    token_matches.append((len(token), option))
+                    break
+        if token_matches:
+            token_matches.sort(key=lambda item: item[0], reverse=True)
+            return token_matches[0][1]
+        return None
+
+    def _prompt_complement_quantity(self, option: dict) -> str:
+        return f"Qual quantidade de {option['produto']} você deseja adicionar?"
+
+    def _merge_item_lists(self, current_items: list[dict], extra_item: dict) -> list[dict]:
+        merged = [item.copy() for item in current_items]
+        for item in merged:
+            if item.get("produto_id") and item.get("produto_id") == extra_item.get("produto_id"):
+                item["quantidade"] = int(item.get("quantidade") or 0) + int(extra_item["quantidade"])
+                item["subtotal"] = round(item["quantidade"] * float(item["valor_unitario"]), 2)
+                return merged
+            if item.get("produto_key") == extra_item.get("produto_key"):
+                item["quantidade"] = int(item.get("quantidade") or 0) + int(extra_item["quantidade"])
+                item["subtotal"] = round(item["quantidade"] * float(item["valor_unitario"]), 2)
+                return merged
+        merged.append(extra_item)
+        return merged
+
+    def _build_complement_item(self, option: dict, quantidade: int) -> dict:
+        qty = max(1, int(quantidade or 1))
+        return {
+            "produto": option["produto"],
+            "produto_key": option["produto_key"],
+            "produto_id": option.get("produto_id"),
+            "quantidade": qty,
+            "valor_unitario": float(option["valor_unitario"]),
+            "subtotal": round(qty * float(option["valor_unitario"]), 2),
+        }
+
+    def _should_add_complement_immediately(
+        self,
+        message: str,
+        quantidade: int | None,
+        selected_option: dict | None = None,
+    ) -> bool:
+        if not quantidade:
+            return False
+        normalized = self._normalize(message)
+        if selected_option is not None and normalized == (selected_option.get("choice") or ""):
+            return False
+        return True
+
+    def _finish_complement_stage(self, telefone: str) -> dict:
+        update_state(telefone, aguardando_resposta="tipo_entrega", itens_pendentes=[])
+        refreshed = get_or_create_state(telefone)
+        pricing = {
+            "can_calculate": bool(refreshed.valor_total),
+            "needs_owner": False,
+            "unit_price": refreshed.valor_unitario,
+            "total_price": refreshed.valor_total,
+        }
+        next_question = self._next_question(refreshed, pricing)
+        current_state = get_or_create_state(telefone)
+        update_state(telefone, aguardando_resposta=self._awaiting_field(current_state, pricing))
+        current_state = get_or_create_state(telefone)
+        return {
+            "state": asdict(current_state),
+            "pricing": pricing,
+            "next_question": next_question,
+            "response": next_question,
+        }
+
+    def _add_complement_to_order(self, telefone: str, option: dict, quantidade: int) -> dict:
+        state = get_or_create_state(telefone)
+        updated_items = self._merge_item_lists(
+            state.itens_pedido or [],
+            self._build_complement_item(option, quantidade),
+        )
+        total_price = round(sum(float(item["subtotal"]) for item in updated_items), 2)
+        update_state(
+            telefone,
+            itens_pedido=updated_items,
+            valor_total=total_price,
+            valor_unitario=float(updated_items[0]["valor_unitario"]) if updated_items else 0.0,
+            aguardando_resposta="mais_complementos",
+            itens_pendentes=[],
+        )
+        refreshed = get_or_create_state(telefone)
+        response = self._build_items_summary_response(
+            items=refreshed.itens_pedido,
+            total=refreshed.valor_total,
+            ask_address=False,
+            title="Perfeito 😊 Atualizei seu pedido:",
+        )
+        response = f"{response}\n\n{self._more_complements_prompt()}"
+        return {
+            "state": asdict(refreshed),
+            "pricing": {
+                "can_calculate": True,
+                "needs_owner": False,
+                "unit_price": refreshed.valor_unitario,
+                "total_price": refreshed.valor_total,
+            },
+            "next_question": self._more_complements_prompt(),
+            "response": response,
+        }
 
     def _delivery_mode_prompt(self) -> str:
         business = self._business_settings()
@@ -524,6 +754,142 @@ class OrderAgent:
                 },
                 "next_question": "",
                 "response": "Pedido cancelado. Se precisar de algo mais, é só me chamar.",
+            }
+
+        if state.aguardando_resposta == "complemento":
+            options = self._list_available_complements()
+            if not options:
+                return self._finish_complement_stage(telefone)
+
+            if self._is_negative_complement_answer(normalized, self._complement_skip_choice(options)):
+                return self._finish_complement_stage(telefone)
+
+            selected_option = self._extract_complement_choice(normalized, options)
+            if selected_option is None:
+                prompt = self._complement_prompt()
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": prompt,
+                    "response": prompt,
+                }
+
+            selected_qty = self._to_int(message) or self._to_int(normalized)
+            if self._should_add_complement_immediately(message, selected_qty, selected_option):
+                return self._add_complement_to_order(telefone, selected_option, selected_qty)
+
+            update_state(
+                telefone,
+                itens_pendentes=[selected_option],
+                aguardando_resposta="quantidade_complemento",
+            )
+            refreshed = get_or_create_state(telefone)
+            quantity_prompt = self._prompt_complement_quantity(selected_option)
+            return {
+                "state": asdict(refreshed),
+                "pricing": {
+                    "can_calculate": bool(refreshed.valor_total),
+                    "needs_owner": False,
+                    "unit_price": refreshed.valor_unitario,
+                    "total_price": refreshed.valor_total,
+                },
+                "next_question": quantity_prompt,
+                "response": quantity_prompt,
+            }
+
+        if state.aguardando_resposta == "quantidade_complemento":
+            pending_option = self._find_pending_complement(state)
+            if pending_option is None:
+                update_state(telefone, aguardando_resposta="complemento", itens_pendentes=[])
+                prompt = self._complement_prompt()
+                return {
+                    "state": asdict(get_or_create_state(telefone)),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": prompt,
+                    "response": prompt,
+                }
+
+            selected_qty = self._to_int(message) or self._to_int(normalized)
+            if not selected_qty:
+                quantity_prompt = self._prompt_complement_quantity(pending_option)
+                return {
+                    "state": asdict(state),
+                    "pricing": {
+                        "can_calculate": bool(state.valor_total),
+                        "needs_owner": False,
+                        "unit_price": state.valor_unitario,
+                        "total_price": state.valor_total,
+                    },
+                    "next_question": quantity_prompt,
+                    "response": quantity_prompt,
+                }
+            return self._add_complement_to_order(telefone, pending_option, selected_qty)
+
+        if state.aguardando_resposta == "mais_complementos":
+            if self._is_negative_complement_answer(normalized, "2"):
+                return self._finish_complement_stage(telefone)
+
+            options = self._list_available_complements()
+            selected_option = self._extract_complement_choice(normalized, options)
+            if selected_option is not None:
+                selected_qty = self._to_int(message) or self._to_int(normalized)
+                if self._should_add_complement_immediately(message, selected_qty, selected_option):
+                    return self._add_complement_to_order(telefone, selected_option, selected_qty)
+                update_state(
+                    telefone,
+                    itens_pendentes=[selected_option],
+                    aguardando_resposta="quantidade_complemento",
+                )
+                refreshed = get_or_create_state(telefone)
+                quantity_prompt = self._prompt_complement_quantity(selected_option)
+                return {
+                    "state": asdict(refreshed),
+                    "pricing": {
+                        "can_calculate": bool(refreshed.valor_total),
+                        "needs_owner": False,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": refreshed.valor_total,
+                    },
+                    "next_question": quantity_prompt,
+                    "response": quantity_prompt,
+                }
+
+            if self._is_positive_more_complements_answer(normalized):
+                update_state(telefone, aguardando_resposta="complemento")
+                refreshed = get_or_create_state(telefone)
+                prompt = self._complement_prompt()
+                return {
+                    "state": asdict(refreshed),
+                    "pricing": {
+                        "can_calculate": bool(refreshed.valor_total),
+                        "needs_owner": False,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": refreshed.valor_total,
+                    },
+                    "next_question": prompt,
+                    "response": prompt,
+                }
+
+            return {
+                "state": asdict(state),
+                "pricing": {
+                    "can_calculate": bool(state.valor_total),
+                    "needs_owner": False,
+                    "unit_price": state.valor_unitario,
+                    "total_price": state.valor_total,
+                },
+                "next_question": self._more_complements_prompt(),
+                "response": self._more_complements_prompt(),
             }
 
         if self._is_waiting_marmita_type(state):
@@ -932,7 +1298,7 @@ class OrderAgent:
                 "response": response,
             }
 
-        if self._is_local_pickup(normalized):
+        if self._is_local_pickup(normalized) and "marmita" not in normalized and "marmitex" not in normalized:
             update_state(
                 telefone,
                 tipo_entrega="retirada",
@@ -962,6 +1328,17 @@ class OrderAgent:
             waiting_question = (
                 self._delivery_mode_prompt()
             )
+            if state.aguardando_resposta == "complemento":
+                waiting_question = self._complement_prompt()
+            elif state.aguardando_resposta == "mais_complementos":
+                waiting_question = self._more_complements_prompt()
+            elif state.aguardando_resposta == "quantidade_complemento":
+                pending_option = self._find_pending_complement(state)
+                waiting_question = (
+                    self._prompt_complement_quantity(pending_option)
+                    if pending_option is not None
+                    else self._complement_prompt()
+                )
             if state.tipo_entrega == "entrega":
                 waiting_status = AtendimentoStatus.AGUARDANDO_ENDERECO
                 waiting_question = self._delivery_address_prompt()
@@ -1035,7 +1412,17 @@ class OrderAgent:
             }
 
         if items_data["items"]:
-            return self._apply_order_items(telefone, items_data["items"])
+            result = self._apply_order_items(telefone, items_data["items"])
+            if self._is_local_pickup(normalized):
+                update_state(telefone, tipo_entrega="retirada", endereco="retirada no local")
+                result["state"] = asdict(get_or_create_state(telefone))
+            elif self._looks_like_address(text):
+                update_state(telefone, tipo_entrega="entrega", endereco=message.strip())
+                result["state"] = asdict(get_or_create_state(telefone))
+            elif self._looks_like_delivery(normalized):
+                update_state(telefone, tipo_entrega="entrega")
+                result["state"] = asdict(get_or_create_state(telefone))
+            return result
 
         if state.status_atendimento == AtendimentoStatus.AGUARDANDO_CONFIRMACAO_ITEM:
             if self._is_positive_confirmation(text):
@@ -1214,6 +1601,8 @@ class OrderAgent:
         endereco = (structured_analysis.get("endereco") or "").strip()
 
         if intencao == "alterar_quantidade":
+            if state.aguardando_resposta in {"complemento", "quantidade_complemento", "mais_complementos"}:
+                return None
             if not in_order:
                 return None
             parsed_qty = self._to_int(str(quantidade)) if quantidade is not None else None
@@ -1250,6 +1639,30 @@ class OrderAgent:
                     },
                     "next_question": self._delivery_mode_prompt(),
                     "response": f"Retirada no local indisponível no momento.\n\n{self._delivery_mode_prompt()}",
+                }
+            if state.aguardando_resposta in {"complemento", "quantidade_complemento", "mais_complementos"}:
+                update_state(
+                    telefone,
+                    tipo_entrega="retirada",
+                    endereco="retirada no local",
+                    ultima_intencao="fazer_pedido",
+                )
+                refreshed = get_or_create_state(telefone)
+                prompt = (
+                    self._prompt_complement_quantity(self._find_pending_complement(refreshed))
+                    if refreshed.aguardando_resposta == "quantidade_complemento" and self._find_pending_complement(refreshed)
+                    else (self._more_complements_prompt() if refreshed.aguardando_resposta == "mais_complementos" else self._complement_prompt())
+                )
+                return {
+                    "state": asdict(refreshed),
+                    "pricing": {
+                        "can_calculate": bool(refreshed.valor_total),
+                        "needs_owner": False,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": refreshed.valor_total,
+                    },
+                    "next_question": prompt,
+                    "response": prompt,
                 }
             update_state(
                 telefone,
@@ -1311,6 +1724,31 @@ class OrderAgent:
                     },
                     "next_question": self._delivery_mode_prompt(),
                     "response": f"Entrega indisponível no momento.\n\n{self._delivery_mode_prompt()}",
+                }
+            if state.aguardando_resposta in {"complemento", "quantidade_complemento", "mais_complementos"}:
+                update_fields = {
+                    "tipo_entrega": "entrega",
+                    "ultima_intencao": "fazer_pedido",
+                }
+                if endereco:
+                    update_fields["endereco"] = endereco
+                update_state(telefone, **update_fields)
+                refreshed = get_or_create_state(telefone)
+                prompt = (
+                    self._prompt_complement_quantity(self._find_pending_complement(refreshed))
+                    if refreshed.aguardando_resposta == "quantidade_complemento" and self._find_pending_complement(refreshed)
+                    else (self._more_complements_prompt() if refreshed.aguardando_resposta == "mais_complementos" else self._complement_prompt())
+                )
+                return {
+                    "state": asdict(refreshed),
+                    "pricing": {
+                        "can_calculate": bool(refreshed.valor_total),
+                        "needs_owner": False,
+                        "unit_price": refreshed.valor_unitario,
+                        "total_price": refreshed.valor_total,
+                    },
+                    "next_question": prompt,
+                    "response": prompt,
                 }
             if tipo_entrega == "entrega" and not endereco:
                 update_state(
@@ -1432,69 +1870,31 @@ class OrderAgent:
                 telefone,
                 tipo_entrega="retirada",
                 endereco="retirada no local",
-                status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
-                aguardando_resposta="nome_cliente",
             )
             refreshed = get_or_create_state(telefone)
             result["state"] = asdict(refreshed)
             result["pricing"]["unit_price"] = refreshed.valor_unitario
             result["pricing"]["total_price"] = refreshed.valor_total
-            result["next_question"] = self._customer_name_prompt()
-            result["response"] = (
-                self._build_items_summary_response(
-                    items=refreshed.itens_pedido,
-                    total=refreshed.valor_total,
-                    ask_address=False,
-                )
-                + f"\n\n{self._pickup_confirmation_text()}\n\n"
-                + self._customer_name_prompt()
-            )
         elif tipo_entrega == "entrega":
             if endereco:
                 update_state(
                     telefone,
                     tipo_entrega="entrega",
                     endereco=endereco,
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
-                    aguardando_resposta="nome_cliente",
                 )
                 refreshed = get_or_create_state(telefone)
                 result["state"] = asdict(refreshed)
                 result["pricing"]["unit_price"] = refreshed.valor_unitario
                 result["pricing"]["total_price"] = refreshed.valor_total
-                result["next_question"] = self._customer_name_prompt()
-                result["response"] = (
-                    self._build_items_summary_response(
-                        items=refreshed.itens_pedido,
-                        total=refreshed.valor_total,
-                        ask_address=False,
-                    )
-                    + f"\n\nPerfeito 😊 Endereço anotado. {self._customer_name_prompt()}"
-                )
             else:
                 update_state(
                     telefone,
                     tipo_entrega="entrega",
-                    status_atendimento=AtendimentoStatus.AGUARDANDO_ENDERECO,
-                    aguardando_resposta="endereco",
                 )
                 refreshed = get_or_create_state(telefone)
                 result["state"] = asdict(refreshed)
                 result["pricing"]["unit_price"] = refreshed.valor_unitario
                 result["pricing"]["total_price"] = refreshed.valor_total
-                result["next_question"] = (
-                    "Perfeito 😊 Vou marcar como entrega.\n\n"
-                    f"{self._delivery_address_prompt()}"
-                )
-                result["response"] = (
-                    self._build_items_summary_response(
-                        items=refreshed.itens_pedido,
-                        total=refreshed.valor_total,
-                        ask_address=False,
-                    )
-                    + "\n\nPerfeito 😊 Vou marcar como entrega.\n\n"
-                    + self._delivery_address_prompt()
-                )
         return result
 
     def _make_item_from_key(self, produto_key: str, quantidade: int) -> dict | None:
@@ -1561,51 +1961,14 @@ class OrderAgent:
         refreshed = get_or_create_state(telefone)
 
         if refreshed.tipo_entrega == "retirada":
-            update_state(
-                telefone,
-                endereco="retirada no local",
-                status_atendimento=AtendimentoStatus.AGUARDANDO_NOME_CLIENTE,
-                aguardando_resposta="nome_cliente",
-            )
+            update_state(telefone, endereco="retirada no local")
             current = get_or_create_state(telefone)
             result["state"] = asdict(current)
-            result["pricing"]["unit_price"] = current.valor_unitario
-            result["pricing"]["total_price"] = current.valor_total
-            result["next_question"] = self._customer_name_prompt()
-            result["response"] = (
-                self._build_items_summary_response(
-                    items=current.itens_pedido,
-                    total=current.valor_total,
-                    ask_address=False,
-                )
-                + f"\n\n{self._pickup_confirmation_text()}\n\n"
-                + self._customer_name_prompt()
-            )
             return result
 
         if refreshed.tipo_entrega == "entrega" and not refreshed.endereco:
-            update_state(
-                telefone,
-                status_atendimento=AtendimentoStatus.AGUARDANDO_ENDERECO,
-                aguardando_resposta="endereco",
-            )
             current = get_or_create_state(telefone)
             result["state"] = asdict(current)
-            result["pricing"]["unit_price"] = current.valor_unitario
-            result["pricing"]["total_price"] = current.valor_total
-            result["next_question"] = (
-                "Perfeito 😊 Vou marcar como entrega.\n\n"
-                f"{self._delivery_address_prompt()}"
-            )
-            result["response"] = (
-                self._build_items_summary_response(
-                    items=current.itens_pedido,
-                    total=current.valor_total,
-                    ask_address=False,
-                )
-                + "\n\nPerfeito 😊 Vou marcar como entrega.\n\n"
-                + self._delivery_address_prompt()
-            )
         return result
 
     def _wants_to_order(self, text: str) -> bool:
@@ -1684,6 +2047,7 @@ class OrderAgent:
         return {
             "produto": produto,
             "produto_key": produto_key,
+            "produto_id": getattr(catalog_item.get("produto"), "id", None),
             "quantidade": quantidade,
             "valor_unitario": unit,
             "subtotal": round(quantidade * unit, 2),
@@ -1696,6 +2060,8 @@ class OrderAgent:
         if clear_pending:
             pending_fields = {"itens_pendentes": []}
         has_pending_additional_review = self._items_have_pending_additional_review(items)
+        complement_prompt = self._complement_prompt()
+        waiting_for_complement = bool(items) and not has_pending_additional_review and bool(self._list_available_complements())
         update_state(
             telefone,
             ultima_intencao="fazer_pedido",
@@ -1709,18 +2075,26 @@ class OrderAgent:
             quantidade=first["quantidade"],
             valor_unitario=first["valor_unitario"],
             valor_total=total_price,
-            aguardando_resposta="confirmacao_item" if has_pending_additional_review else "tipo_entrega",
+            aguardando_resposta=(
+                "confirmacao_item"
+                if has_pending_additional_review
+                else ("complemento" if waiting_for_complement else "tipo_entrega")
+            ),
             **pending_fields,
         )
         refreshed = get_or_create_state(telefone)
         response = self._build_items_summary_response(
             items=refreshed.itens_pedido,
             total=refreshed.valor_total,
-            ask_address=not bool(refreshed.tipo_entrega) and not has_pending_additional_review,
-            show_partial_label=has_pending_additional_review,
+            ask_address=False,
+            show_partial_label=has_pending_additional_review or waiting_for_complement,
         )
         if has_pending_additional_review:
             response = f"{response}\n\n{self._observation_review_prompt()}"
+        elif waiting_for_complement:
+            response = f"{response}\n\n{complement_prompt}"
+        elif not refreshed.tipo_entrega:
+            response = f"{response}\n\n{self._delivery_mode_prompt()}"
         return {
             "state": asdict(refreshed),
             "pricing": {
@@ -1729,7 +2103,11 @@ class OrderAgent:
                 "unit_price": refreshed.valor_unitario,
                 "total_price": refreshed.valor_total,
             },
-            "next_question": self._observation_review_prompt() if has_pending_additional_review else self._delivery_mode_prompt(),
+            "next_question": (
+                self._observation_review_prompt()
+                if has_pending_additional_review
+                else (complement_prompt if waiting_for_complement else self._delivery_mode_prompt())
+            ),
             "response": response,
         }
 
@@ -2164,6 +2542,9 @@ class OrderAgent:
             return True
         return any(term in normalized_text for term in pickup_terms)
 
+    def _looks_like_delivery(self, normalized_text: str) -> bool:
+        return any(term in normalized_text for term in ["entrega", "entregar", "para entregar"])
+
     def _is_delivery_choice(self, normalized_text: str) -> bool:
         return normalized_text in {"1", "entrega", "quero entrega", "entregar"}
 
@@ -2266,6 +2647,8 @@ class OrderAgent:
             return "quantidade"
         if pricing.get("needs_owner"):
             return "consulta_proprietaria"
+        if state.itens_pedido and not state.tipo_entrega and state.aguardando_resposta != "tipo_entrega":
+            return "complemento"
         if not state.tipo_entrega:
             return "tipo_entrega"
         if state.tipo_entrega != "retirada" and not state.endereco:
@@ -2289,6 +2672,9 @@ class OrderAgent:
         if waiting == "consulta_proprietaria":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.ENCAMINHAR_ATENDENTE)
             return self._owner_consultation_message()
+        if waiting == "complemento":
+            update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
+            return self._complement_prompt()
         if waiting == "tipo_entrega":
             update_state(state.telefone, status_atendimento=AtendimentoStatus.AGUARDANDO_TIPO_ENTREGA)
             return self._delivery_mode_prompt()
@@ -2465,8 +2851,9 @@ class OrderAgent:
         total: float,
         ask_address: bool,
         show_partial_label: bool = False,
+        title: str = "Perfeito 😊 Seu pedido ficou assim:",
     ) -> str:
-        lines = ["Perfeito 😊 Seu pedido ficou assim:", ""]
+        lines = [title, ""]
         for item in items:
             subtotal = f"R$ {float(item['subtotal']):.2f}".replace(".", ",")
             qty = int(item["quantidade"])
@@ -2494,6 +2881,12 @@ class OrderAgent:
             return "marmitex individuais"
         if produto.startswith("marmita para "):
             return produto.replace("marmita para ", "marmitas para ", 1)
+        if produto in {"agua mineral", "água mineral"}:
+            return "águas minerais" if "á" in produto else "aguas minerais"
+        if produto == "ovo adicional":
+            return "ovos adicionais"
+        if produto == "sobremesa do dia":
+            return "sobremesas do dia"
         return produto
 
     def _marmita_type_prompt(self) -> str:
