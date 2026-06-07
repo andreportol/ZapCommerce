@@ -518,9 +518,9 @@ class CardapioDayContextTests(SimpleTestCase):
         updated = self.orchestrator.handle_message("quero 2 ovos adicionais", telefone=telefone)
         state = self._store[telefone]
 
-        self.assertIn("* 1 marmita para 3 pessoas: R$ 60,00", updated["final_response"])
+        self.assertIn("* 1 marmita para 3 pessoas: R$ 85,00", updated["final_response"])
         self.assertIn("* 2 ovos adicionais: R$ 5,00", updated["final_response"])
-        self.assertIn("Total: R$ 65,00", updated["final_response"])
+        self.assertIn("Total: R$ 90,00", updated["final_response"])
         self.assertIn("Deseja adicionar mais algum item?", updated["final_response"])
         self.assertEqual(state.aguardando_resposta, "mais_complementos")
 
@@ -1035,10 +1035,10 @@ class CardapioDayContextTests(SimpleTestCase):
 
         fake_catalog = {
             "marmitex_individual": {"nome": "Marmitex Individual", "preco": 21.0},
-            "marmita_2_pessoas": {"nome": "Marmita para 2 pessoas", "preco": 44.0},
-            "marmita_3_pessoas": {"nome": "Marmita para 3 pessoas", "preco": 60.0},
-            "marmita_4_pessoas": {"nome": "Marmita para 4 pessoas", "preco": 76.0},
-            "marmita_5_pessoas": {"nome": "Marmita para 5 pessoas", "preco": 92.0},
+            "marmita_2_pessoas": {"nome": "Marmita para 2 pessoas", "preco": 65.0},
+            "marmita_3_pessoas": {"nome": "Marmita para 3 pessoas", "preco": 85.0},
+            "marmita_4_pessoas": {"nome": "Marmita para 4 pessoas", "preco": 105.0},
+            "marmita_5_pessoas": {"nome": "Marmita para 5 pessoas", "preco": 125.0},
         }
 
         orchestrator_module.get_order_product = lambda key, only_available=True: fake_catalog.get(key)
@@ -1048,10 +1048,10 @@ class CardapioDayContextTests(SimpleTestCase):
         orchestrator_module.list_order_products = lambda only_available=True: list(fake_catalog.values())
         orchestrator_module.get_order_product_choices = lambda: [
             {"choice": "1", "key": "marmitex_individual", "nome": "Marmitex Individual", "preco": 21.0, "people_count": None},
-            {"choice": "2", "key": "marmita_2_pessoas", "nome": "Marmita para 2 pessoas", "preco": 44.0, "people_count": 2},
-            {"choice": "3", "key": "marmita_3_pessoas", "nome": "Marmita para 3 pessoas", "preco": 60.0, "people_count": 3},
-            {"choice": "4", "key": "marmita_4_pessoas", "nome": "Marmita para 4 pessoas", "preco": 76.0, "people_count": 4},
-            {"choice": "5", "key": "marmita_5_pessoas", "nome": "Marmita para 5 pessoas", "preco": 92.0, "people_count": 5},
+            {"choice": "2", "key": "marmita_2_pessoas", "nome": "Marmita para 2 pessoas", "preco": 65.0, "people_count": 2},
+            {"choice": "3", "key": "marmita_3_pessoas", "nome": "Marmita para 3 pessoas", "preco": 85.0, "people_count": 3},
+            {"choice": "4", "key": "marmita_4_pessoas", "nome": "Marmita para 4 pessoas", "preco": 105.0, "people_count": 4},
+            {"choice": "5", "key": "marmita_5_pessoas", "nome": "Marmita para 5 pessoas", "preco": 125.0, "people_count": 5},
         ]
         orchestrator_module.format_brl = lambda value: f"R$ {float(value):.2f}".replace(".", ",")
 
